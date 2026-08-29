@@ -107,6 +107,23 @@
   .grid-2{display:grid; grid-template-columns:1fr 1fr; gap:16px;}
   @media(max-width:760px){.grid-2{grid-template-columns:1fr;}}
 
+  /* Mobile fixes: scrollable tables instead of breaking page layout,
+     and stacked controls instead of overflow on narrow phones */
+  #draftBoardWrap, #waiverWrap, #teamWrap, #standingsWrap, #benchWrap, #needsWrap {
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  table { min-width: 460px; }
+  @media(max-width:480px){
+    .wrap{padding:16px 12px 60px;}
+    .hero{padding:18px 16px;}
+    .controls-row{flex-direction:column; align-items:stretch;}
+    .controls-row input[type=text], .controls-row select, .controls-row button{
+      min-width:0; width:100%;
+    }
+    .tabs{gap:2px;}
+    .tab{padding:10px 10px; font-size:12px;}
+  }
+
   .stat-box{background:var(--panel-2); border:1px solid var(--line); border-radius:8px; padding:12px 14px;}
   .stat-box .num{font-family:'Anton',sans-serif; font-size:26px; color:var(--turf-bright);}
   .stat-box .lbl{font-family:'IBM Plex Mono',monospace; font-size:10.5px; text-transform:uppercase; letter-spacing:1px; color:var(--chalk-dim);}
@@ -315,14 +332,14 @@
       <div class="card">
         <h2>Live Stats Feed</h2>
         <div class="desc">
-          Optional: connect a small GitHub Actions repo (free, ~10 min one-time setup) that refreshes real season stats
-          on a schedule and pushes them here automatically — no redeploying needed. Without this, the app uses the
-          2025 season snapshot baked in at build time.
+          Connects automatically on any device to a GitHub Actions repo that refreshes real season stats twice a day —
+          no per-device setup, nothing to click. The box below shows which feed is active; only touch it if you ever
+          want to point at a different stats repo.
         </div>
         <div id="liveStatsStatus" class="hint" style="margin-bottom:10px;">Checking...</div>
         <div class="controls-row">
           <input type="text" id="statsRepoUrlInput" placeholder="https://raw.githubusercontent.com/you/your-repo/main/stats.json">
-          <button class="ghost" onclick="saveStatsRepoUrl()">Connect Feed</button>
+          <button class="ghost" onclick="saveStatsRepoUrl()">Use This Feed Instead</button>
         </div>
       </div>
 
@@ -330,9 +347,12 @@
         <h2>Data Sources</h2>
         <div class="desc" style="margin-bottom:0;">
           Roster/league/draft data: Sleeper API, live. Player pool &amp; consensus rank: Sleeper's own search_rank.
-          Production stats ('25 PPG / GP): nflverse-data, an open free dataset — most recent completed season available in it.
-          This app does not have access to paid projection services (FantasyPros, PFF, ESPN, Rotowire) or team beat-writer depth chart intel —
-          for a genuinely "best possible" pick, cross-check injury news and depth charts close to your draft/waiver deadline.
+          Season production ('25 PPG / GP), draft capital (round/pick), and live depth chart position — all from
+          nflverse-data, an open free dataset, refreshed twice daily. Draft capital and depth chart exist the moment
+          a player is drafted or added to a roster, so they're the main signal available for rookies before any NFL
+          production exists. This app still doesn't have access to paid projection services (FantasyPros, PFF, ESPN,
+          Rotowire) — for a genuinely "best possible" pick on close calls, cross-check those free previews near your
+          deadline.
         </div>
       </div>
     </div>
@@ -366,10 +386,10 @@ async function safeGet(url){
 }
 
 async function storageGet(key){
-  try{ const r = await window.storage.get(key); return r ? JSON.parse(r.value) : null; }catch(e){ return null; }
+  try{ const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; }catch(e){ return null; }
 }
 async function storageSet(key, val){
-  try{ await window.storage.set(key, JSON.stringify(val)); }catch(e){ /* non-fatal */ }
+  try{ localStorage.setItem(key, JSON.stringify(val)); }catch(e){ /* non-fatal */ }
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -381,6 +401,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   if(statsUrl){
     document.getElementById("statsRepoUrlInput").value = statsUrl;
   }
+  loadLiveStats(true);
 });
 
 async function connect(){
@@ -471,9 +492,13 @@ function renderHeroMeta(){
 
 /* ---------------- PLAYER POOL ---------------- */
 /* ---------------- LIVE STATS (server-side scheduled updater) ---------------- */
+// Baked-in default so this works the same on every device, no per-browser setup required.
+// The Live Stats Feed box still lets you override this if you ever want a different repo.
+const DEFAULT_STATS_URL = "https://raw.githubusercontent.com/dchun29/sleeper-stats/refs/heads/main/stats.json";
+
 async function getStatsRepoUrl(){
   const stored = await storageGet("stats_repo_url");
-  return stored && stored.url ? stored.url : null;
+  return (stored && stored.url) ? stored.url : DEFAULT_STATS_URL;
 }
 
 async function loadLiveStats(silent){
@@ -631,16 +656,19 @@ function renderDraftBoard(){
     .filter(p => filter === "ALL" || p.position === filter);
 
   if(sortMode === "ppg"){
-    list = list.filter(p => p._stats).sort((a,b) => b._stats.ppg - a._stats.ppg);
+    // Show proven-production players first, then rookies/no-data players by consensus
+    // rank — never drop them, since a rookie with no prior-season stats is often still
+    // a top-60 consensus pick and shouldn't just vanish from the board.
+    const scored = list.filter(p => p._stats && p._stats.ppg != null).sort((a,b) => b._stats.ppg - a._stats.ppg);
+    const unscored = list.filter(p => !(p._stats && p._stats.ppg != null)).sort((a,b) => a.search_rank - b.search_rank);
+    list = [...scored, ...unscored];
   } else {
     list = list.sort((a,b) => a.search_rank - b.search_rank);
   }
   list = list.slice(0, 60);
 
   if(list.length === 0){
-    wrap.innerHTML = sortMode === "ppg"
-      ? "<div class='empty'>No 2024 production data for this filter (rookies, DEF, and some new signings/injuries won't have full 2025 data). Try Consensus Rank sort.</div>"
-      : "<div class='empty'>No available players match this filter.</div>";
+    wrap.innerHTML = "<div class='empty'>No available players match this filter.</div>";
     return;
   }
 
@@ -652,13 +680,14 @@ function renderDraftBoard(){
     const isNeed = need[p.position] && filled[p.position] < need[p.position];
     const inj = p.injury_status && INJURY_LABEL[p.injury_status];
     const stats = p._stats;
+    const extraTag = buildContextTag(stats);
     return `<tr>
       <td class="rank">#${p.search_rank}</td>
-      <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""}</td>
+      <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag}</td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
-      <td class="rank">${stats ? stats.ppg.toFixed(1) : "—"}</td>
-      <td class="rank">${stats ? stats.gp : "—"}</td>
+      <td class="rank">${stats && stats.ppg != null ? stats.ppg.toFixed(1) : "—"}</td>
+      <td class="rank">${stats && stats.gp != null ? stats.gp : "—"}</td>
     </tr>`;
   }).join("");
 
@@ -666,6 +695,23 @@ function renderDraftBoard(){
     <thead><tr><th>Rank</th><th>Player</th><th>Pos</th><th>Team</th><th>'25 PPG</th><th>'25 GP</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+// Builds a small context tag for players without prior-season production —
+// depth chart rank and draft capital are both live before any games are
+// played, so they're the most useful signal available for rookies.
+function buildContextTag(stats){
+  if(!stats) return "";
+  if(stats.ppg != null) {
+    // Has production, but still show a starter badge if notably relevant
+    if(stats.dr === 1) return '<span class="need-tag" style="border-color:var(--turf-bright); color:var(--turf-bright);">Starter</span>';
+    return "";
+  }
+  const bits = [];
+  if(stats.dr != null) bits.push(stats.dr === 1 ? "Depth: Starter" : `Depth: #${stats.dr}`);
+  if(stats.dc) bits.push(`Rd${stats.dc.rd}.${stats.dc.pk} (${stats.dc.yr})`);
+  if(bits.length === 0) return '<span class="need-tag" style="border-color:var(--steel); color:var(--chalk-dim);">No \'25 data</span>';
+  return `<span class="need-tag" style="border-color:var(--amber); color:var(--amber);">${bits.join(" · ")}</span>`;
 }
 
 /* ---------------- AUTO-REFRESH ---------------- */
@@ -717,11 +763,12 @@ async function loadTrending(){
       const isNeed = need[p.position] && filled[p.position] < need[p.position];
       const inj = p.injury_status && INJURY_LABEL[p.injury_status];
       const stats = p._stats;
+      const extraTag = buildContextTag(stats);
       return `<tr>
-        <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""}</td>
+        <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag}</td>
         <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
         <td>${p.team || "FA"}</td>
-        <td class="rank">${stats ? stats.ppg.toFixed(1) : "—"}</td>
+        <td class="rank">${stats && stats.ppg != null ? stats.ppg.toFixed(1) : "—"}</td>
         <td class="rank">${t.count.toLocaleString()} adds</td>
       </tr>`;
     }).join("");
@@ -853,10 +900,13 @@ const FLEX_ELIGIBLE = {
 };
 
 function projectedPts(p){
-  if(!p) return {val:0, label:"—", warn:null};
-  let base = p._stats ? p._stats.ppg : null;
+  if(!p) return {val:0, label:"—", warn:null, context:""};
+  const s = p._stats;
+  let base = (s && s.ppg != null) ? s.ppg : null;
   let warn = null;
-  if(base === null){ return {val:0, label:"No data", warn:"no-data"}; }
+  if(base === null){
+    return {val:0, label:"No data", warn:"no-data", context: buildContextTag(s)};
+  }
   const inj = p.injury_status;
   if(inj === "Out" || inj === "IR" || inj === "PUP" || inj === "Suspended"){
     warn = inj; base = 0;
@@ -865,7 +915,7 @@ function projectedPts(p){
   } else if(inj === "Questionable"){
     warn = inj; base = base * 0.85;
   }
-  return {val: base, label: base.toFixed(1), warn};
+  return {val: base, label: base.toFixed(1), warn, context:""};
 }
 
 function renderLineupOptimizer(){
@@ -919,7 +969,7 @@ function renderLineupOptimizer(){
           const warnTag = a.proj.warn ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${a.proj.warn}</span>` : "";
           return `<tr>
             <td class="rank">${a.slot}</td>
-            <td>${name} ${warnTag}</td>
+            <td>${name} ${warnTag} ${a.proj.context || ""}</td>
             <td><span class="pos-badge pos-${a.p.position}">${a.p.position}</span></td>
             <td class="rank">${a.proj.label}</td>
           </tr>`;
@@ -936,7 +986,7 @@ function renderLineupOptimizer(){
         ${benched.sort((a,b) => b.proj.val - a.proj.val).map(x => {
           const name = x.p.full_name || `${x.p.first_name||""} ${x.p.last_name||""}`.trim();
           const warnTag = x.proj.warn ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${x.proj.warn}</span>` : "";
-          return `<tr><td>${name} ${warnTag}</td><td><span class="pos-badge pos-${x.p.position}">${x.p.position}</span></td><td class="rank">${x.proj.label}</td></tr>`;
+          return `<tr><td>${name} ${warnTag} ${x.proj.context || ""}</td><td><span class="pos-badge pos-${x.p.position}">${x.p.position}</span></td><td class="rank">${x.proj.label}</td></tr>`;
         }).join("")}
       </tbody>
     </table>
