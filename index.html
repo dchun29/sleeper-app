@@ -304,13 +304,12 @@
       </div>
 
       <div class="card">
-        <h2>Latest News &amp; Move Recommendations</h2>
+        <h2>Latest News Quick-Check</h2>
         <div class="desc">
-          Sleeper doesn't publish a news feed, so this runs a live web search (via Claude) across your watch-list players
-          — your injured/questionable guys, plus the top trending adds — and gives you a plain-English read on what
-          changed and what to do about it. Takes ~15-20 seconds. This is on-demand, not a background alert — there's no
-          way for a static page with no server to push notifications to you, so you'll want to check this a couple times
-          a week, especially Wed/Thu and right before your lock.
+          Sleeper doesn't publish a news feed, so this builds a watch list — your injured/questionable guys, plus the
+          top trending adds — and gives you one-click links to check each one on Google News, X, and RotoWire. This is
+          on-demand, not a background alert — there's no way for a static page with no server to push notifications
+          to you, so you'll want to check this a couple times a week, especially Wed/Thu and right before your lock.
         </div>
         <div class="controls-row">
           <button onclick="runNewsCheck()" id="newsCheckBtn">Check Latest News</button>
@@ -1078,15 +1077,15 @@ function renderRosterWatch(){
 async function runNewsCheck(){
   const btn = document.getElementById("newsCheckBtn");
   const wrap = document.getElementById("newsCheckWrap");
-  btn.disabled = true; btn.textContent = "Searching...";
-  wrap.innerHTML = "<div class='loading'>Pulling latest injury/news updates for your watch-list players...</div>";
+  btn.disabled = true; btn.textContent = "Building watch list...";
+  wrap.innerHTML = "<div class='loading'>Finding who needs a check...</div>";
 
   try{
     // Build a watch list: your injured/questionable roster guys + top trending adds not on your roster
     const myFlagged = (state.myRoster?.players || [])
       .map(pid => state.players[pid])
       .filter(p => p && p.injury_status)
-      .map(p => ({name: p.full_name || `${p.first_name} ${p.last_name}`, pos: p.position, note: "on your roster"}));
+      .map(p => ({name: p.full_name || `${p.first_name} ${p.last_name}`, pos: p.position, note: "on your roster", tag: p.injury_status}));
 
     let trendingAdds = [];
     try{
@@ -1095,58 +1094,36 @@ async function runNewsCheck(){
         .map(x => state.players[x.player_id])
         .filter(p => p && !state.rosteredIds.has(p.player_id))
         .slice(0, 5)
-        .map(p => ({name: p.full_name || `${p.first_name} ${p.last_name}`, pos: p.position, note: "trending waiver add"}));
+        .map(p => ({name: p.full_name || `${p.first_name} ${p.last_name}`, pos: p.position, note: "trending waiver add", tag: null}));
     }catch(e){}
 
     const watchList = [...myFlagged, ...trendingAdds].slice(0, 10);
     if(watchList.length === 0){
       wrap.innerHTML = "<div class='empty'>Nothing flagged to check right now — no injured roster players and nothing unusual trending on waivers.</div>";
-      btn.disabled = false; btn.textContent = "Check Latest News";
       return;
     }
 
-    const listText = watchList.map(p => `- ${p.name} (${p.pos}, ${p.note})`).join("\n");
-    const prompt = `You're a fantasy football assistant. Search the web for the latest injury status and news (last 3-5 days) on each of these NFL players:
-${listText}
-
-For each player, respond with ONE JSON object in a JSON array, no markdown fences, no preamble, just the raw JSON array:
-[{"player": "name", "update": "1-2 sentence plain-English summary of what's new", "recommendation": "one of DROP, SIT, ADD, START, HOLD, MONITOR"}]
-
-If you find nothing notable for a player, still include them with update "No meaningful update found" and recommendation "MONITOR".`;
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1000,
-        messages: [{role: "user", content: prompt}],
-        tools: [{type: "web_search_20250305", name: "web_search"}]
-      })
-    });
-    const data = await res.json();
-    const fullText = (data.content || [])
-      .map(item => item.type === "text" ? item.text : "")
-      .filter(Boolean)
-      .join("\n");
-
-    const clean = fullText.replace(/```json|```/g, "").trim();
-    const jsonStart = clean.indexOf("[");
-    const jsonEnd = clean.lastIndexOf("]");
-    if(jsonStart === -1 || jsonEnd === -1) throw new Error("Couldn't parse a clean response — try again.");
-    const results = JSON.parse(clean.slice(jsonStart, jsonEnd+1));
-
-    wrap.innerHTML = results.map(r => `
-      <div class="alert-card">
+    wrap.innerHTML = watchList.map(p => {
+      const q = encodeURIComponent(p.name + " NFL injury news");
+      const newsUrl = `https://www.google.com/search?q=${q}&tbm=nws`;
+      const xUrl = `https://twitter.com/search?q=${encodeURIComponent(p.name)}&f=live`;
+      const rotoUrl = `https://www.rotowire.com/football/search.php?query=${encodeURIComponent(p.name)}`;
+      const tagHtml = p.tag ? `<span class="rec-tag rec-MONITOR">${p.tag}</span>` : "";
+      return `<div class="alert-card">
         <div class="ahead">
-          <span class="aname">${r.player}</span>
-          <span class="rec-tag rec-${(r.recommendation||"MONITOR").toUpperCase()}">${r.recommendation||"MONITOR"}</span>
+          <span class="aname">${p.name} <span class="pos-badge pos-${p.pos}">${p.pos}</span></span>
+          ${tagHtml}
         </div>
-        <div class="atext">${r.update}</div>
-      </div>
-    `).join("") + `<div class="hint" style="margin-top:6px;">Live web search, not Sleeper data — always double check anything roster-critical before you submit a move.</div>`;
+        <div class="atext" style="margin-bottom:8px;">${p.note}</div>
+        <div class="controls-row" style="margin-bottom:0;">
+          <a class="ghost" style="text-decoration:none; padding:6px 12px; font-size:12px; display:inline-block;" href="${newsUrl}" target="_blank" rel="noopener">Google News</a>
+          <a class="ghost" style="text-decoration:none; padding:6px 12px; font-size:12px; display:inline-block;" href="${xUrl}" target="_blank" rel="noopener">Search X</a>
+          <a class="ghost" style="text-decoration:none; padding:6px 12px; font-size:12px; display:inline-block;" href="${rotoUrl}" target="_blank" rel="noopener">RotoWire</a>
+        </div>
+      </div>`;
+    }).join("") + `<div class="hint" style="margin-top:6px;">One tap per player to check the latest — this app can't run its own AI search once deployed outside Claude.ai, so these are direct links to real, free sources instead.</div>`;
   } catch(e){
-    wrap.innerHTML = `<div class="err">Couldn't complete the news check: ${e.message}</div>`;
+    wrap.innerHTML = `<div class="err">Couldn't build the watch list: ${e.message}</div>`;
   } finally {
     btn.disabled = false; btn.textContent = "Check Latest News";
   }
