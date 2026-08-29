@@ -241,8 +241,12 @@
           <label style="display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--chalk-dim); font-family:'IBM Plex Mono',monospace;">
             <input type="checkbox" id="liveDraftToggle" onchange="toggleLiveDraft()"> Live poll picks
           </label>
+          <label style="display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--chalk-dim); font-family:'IBM Plex Mono',monospace;">
+            <input type="checkbox" id="showDraftedToggle" onchange="renderDraftBoard()"> Show drafted
+          </label>
           <button class="ghost" onclick="loadPlayers(true)">Refresh Player Pool</button>
         </div>
+        <div id="draftStrategyWrap"></div>
         <div class="desc" style="margin-top:-6px;">2025 PPG comes from real season stats (nflverse, open data) — it's proven production, not a projection. Consensus Rank is Sleeper's own popularity/ADP-style rank. Neither is a paid projections service (FantasyPros/PFF/ESPN); use both as inputs, not gospel.</div>
         <div id="draftBoardWrap"><div class="loading">Loading player pool...</div></div>
       </div>
@@ -501,6 +505,7 @@ async function selectLeague(league){
   document.getElementById("app").style.display = "block";
   renderHeroMeta();
   renderLeagueSettings();
+  populateDraftPosFilterOptions();
   await loadPlayers(false);
   await refreshDraftPicks();
   renderTeam();
@@ -564,6 +569,7 @@ async function loadLiveStats(silent){
     Object.values(state.players).forEach(p => {
       p._stats = lookupStats(p);
     });
+    annotateLeaguePPG();
 
     if(statusEl){
       const when = liveStatsGeneratedAt ? new Date(liveStatsGeneratedAt).toLocaleString() : "unknown time";
@@ -600,6 +606,7 @@ async function loadPlayers(force){
     Object.values(state.players).forEach(p => {
       p._stats = lookupStats(p);
     });
+    annotateLeaguePPG();
     renderDraftBoard();
   } catch(e){
     wrap.innerHTML = `<div class="err">Couldn't load player data: ${e.message}</div>`;
@@ -610,6 +617,7 @@ async function refreshDraftPicks(){
   const statusDesc = document.getElementById("draftStatusDesc");
   const boxes = document.getElementById("draftStatBoxes");
   state.draftedIds = new Set();
+  state.draftedBy = {};
   if(!state.draftId){
     statusDesc.textContent = "No draft has been scheduled for this league yet.";
     boxes.innerHTML = "";
@@ -622,7 +630,15 @@ async function refreshDraftPicks(){
       safeGet(`${API}/draft/${state.draftId}/picks`)
     ]);
     state.draftPicks = picks || [];
-    state.draftPicks.forEach(p => { if(p.player_id) state.draftedIds.add(p.player_id); });
+    const teamsCount = (draft.settings && draft.settings.teams) || (state.rosters ? state.rosters.length : null);
+    state.draftPicks.forEach(pk => {
+      if(!pk.player_id) return;
+      state.draftedIds.add(pk.player_id);
+      const roster = state.rosters ? state.rosters.find(r => r.roster_id === pk.roster_id) : null;
+      const teamName = roster ? ownerName(roster.owner_id) : (pk.metadata && pk.metadata.team_name) || "Unknown";
+      const pickInRound = teamsCount ? (((pk.pick_no - 1) % teamsCount) + 1) : pk.pick_no;
+      state.draftedBy[pk.player_id] = {teamName, round: pk.round || Math.ceil(pk.pick_no / (teamsCount||1)), pickInRound, isMe: roster && roster.owner_id === state.myUserId};
+    });
     state.draftObj = draft;
 
     const total = (draft.settings && draft.settings.teams && draft.settings.rounds)
@@ -641,6 +657,7 @@ async function refreshDraftPicks(){
     `;
 
     renderOnClock(draft, made);
+    renderDraftStrategy();
 
     if(status === "drafting" && !draftPollTimer){
       document.getElementById("liveDraftToggle").checked = true;
@@ -666,6 +683,149 @@ function rosterPositionCounts(){
   return counts;
 }
 
+/* ---------------- TEAM STAT PROFILE (strengths/weaknesses, not just position counts) ---------------- */
+// Maps our compact stat keys to Sleeper's scoring_settings keys, so ranking
+// reflects real fantasy point value in THIS league (e.g. half-PPR), not a
+// generic full-PPR assumption or raw yardage that ignores TDs entirely.
+const SCORING_KEY_MAP = {
+  py: "pass_yd", ptd: "pass_td", int: "pass_int",
+  ry: "rush_yd", rtd: "rush_td",
+  rec: "rec", recy: "rec_yd", rectd: "rec_td",
+};
+// Sensible standard-scoring fallbacks if a league's settings omit a key.
+const SCORING_DEFAULTS = {
+  pass_yd: 0.04, pass_td: 4, pass_int: -2,
+  rush_yd: 0.1, rush_td: 6,
+  rec: 0.5, rec_yd: 0.1, rec_td: 6,
+};
+
+function getScoringValue(catKey){
+  const scoringKey = SCORING_KEY_MAP[catKey];
+  const settings = (state.league && state.league.scoring_settings) || {};
+  const v = settings[scoringKey];
+  return (v != null) ? v : SCORING_DEFAULTS[scoringKey];
+}
+
+function getTeBonusValue(){
+  const settings = (state.league && state.league.scoring_settings) || {};
+  return settings.bonus_rec_te || 0;
+}
+
+// Real fantasy points using THIS league's actual scoring settings, not a
+// generic full-PPR assumption. K/DEF: we don't collect kicking or team-D
+// category stats (field goal distances, sacks, etc.), so recomputing from
+// scratch would wrongly show 0 — fall back to nflverse's own PPR total there,
+// which is still a reasonable estimate for those positions specifically.
+function leagueScoredPoints(stats, pos){
+  if(!stats) return null;
+  if(pos === "K" || pos === "DEF"){
+    return stats.pts != null ? stats.pts : null;
+  }
+  let total = 0;
+  STAT_CATEGORIES.forEach(c => { total += (stats[c.key] || 0) * getScoringValue(c.key); });
+  if(pos === "TE") total += (stats.rec || 0) * getTeBonusValue();
+  return total;
+}
+
+function leagueScoredPPG(stats, pos){
+  const pts = leagueScoredPoints(stats, pos);
+  if(pts == null || !stats.gp) return null;
+  return pts / stats.gp;
+}
+
+// Attaches a league-accurate PPG onto every currently-loaded player's stats
+// object, so every table in the app reflects your real scoring (e.g. your
+// Half-PPR settings) instead of nflverse's generic full-PPR total.
+// Known simplification: doesn't yet include 2-point conversions or fumbles
+// lost, since we don't collect those categories — minor in most leagues.
+function annotateLeaguePPG(){
+  Object.values(state.players).forEach(p => {
+    if(p && p._stats){
+      p._stats.leaguePPG = leagueScoredPPG(p._stats, p.position);
+    }
+  });
+}
+
+// Preferred PPG for display/sort: league-weighted when available, otherwise
+// the raw nflverse PPR figure (e.g. before a league is connected).
+function displayPPG(stats){
+  if(!stats) return null;
+  return stats.leaguePPG != null ? stats.leaguePPG : stats.ppg;
+}
+
+function statProfileForPlayerIds(playerIds){
+  const totals = {};
+  STAT_CATEGORIES.forEach(c => totals[c.key] = 0);
+  (playerIds || []).forEach(pid => {
+    const p = state.players[pid];
+    const s = p && p._stats;
+    if(!s) return;
+    STAT_CATEGORIES.forEach(c => { totals[c.key] += (s[c.key] || 0); });
+  });
+  return totals;
+}
+
+// useDraftPicks: true during a live draft (compares picks-so-far across all
+// teams), false for in-season (compares finished rosters).
+function computeLeagueStatProfiles(useDraftPicks){
+  return (state.rosters || []).map(r => {
+    const ids = useDraftPicks
+      ? (state.draftPicks || []).filter(pk => pk.roster_id === r.roster_id && pk.player_id).map(pk => pk.player_id)
+      : (r.players || []);
+    return {rosterId: r.roster_id, isMe: r.owner_id === state.myUserId, totals: statProfileForPlayerIds(ids)};
+  });
+}
+
+function computeMyStrengthsWeaknesses(useDraftPicks){
+  const profiles = computeLeagueStatProfiles(useDraftPicks);
+  const n = profiles.length;
+  const myProfile = profiles.find(p => p.isMe);
+  if(!myProfile || n < 2) return null;
+  const result = {};
+  STAT_CATEGORIES.forEach(c => {
+    const scoringVal = getScoringValue(c.key);
+    // Rank by actual fantasy point contribution of this category (count × your
+    // league's real point value), not the raw count — a TD-heavy team and a
+    // yardage-heavy team with the same "yards" total aren't equally strong.
+    const pointsOf = (t) => t.totals[c.key] * scoringVal;
+    const sorted = [...profiles].sort((a,b) => c.lowerIsBetter ? (pointsOf(a)-pointsOf(b)) : (pointsOf(b)-pointsOf(a)));
+    // when scoringVal is negative (e.g. INT), a bigger raw total is worse — sort direction already handles this
+    const rank = sorted.findIndex(p => p.rosterId === myProfile.rosterId) + 1;
+    result[c.key] = {
+      label: c.label, value: myProfile.totals[c.key], points: pointsOf(myProfile),
+      rank, of: n, lowerIsBetter: c.lowerIsBetter, scoringVal,
+    };
+  });
+  return result;
+}
+
+function renderStatProfileCard(profile, title){
+  if(!profile) return "";
+  const n = Object.values(profile)[0].of;
+  const topCut = Math.max(1, Math.ceil(n / 3));
+  const entries = Object.values(profile).sort((a,b) => a.rank - b.rank);
+  const strengths = entries.filter(e => e.rank <= topCut);
+  const weaknesses = entries.filter(e => e.rank > n - topCut).sort((a,b) => b.rank - a.rank);
+
+  const fmt = e => `<span class="pos-badge" style="background:var(--panel-2); color:${e.rank<=topCut?'var(--turf-bright)':(e.rank>n-topCut?'var(--danger)':'var(--chalk-dim)')};">${e.label}: ${Math.round(e.value)} → ${e.points.toFixed(0)} pts (${e.rank}/${e.of})</span>`;
+
+  return `
+    <div class="alert-card">
+      <div class="ahead"><span class="aname">${title}</span></div>
+      <div class="atext" style="margin-bottom:6px;"><b style="color:var(--turf-bright);">Strengths:</b> ${strengths.map(fmt).join(" ") || "—"}</div>
+      <div class="atext"><b style="color:var(--danger);">Weaknesses:</b> ${weaknesses.map(fmt).join(" ") || "—"}</div>
+      <div class="hint" style="margin-top:6px;">Ranked by actual fantasy points those stats are worth in your league's real scoring settings — a touchdown-heavy category outranks an equal-looking yardage total.</div>
+    </div>
+  `;
+}
+
+function myWeakCategoryKeys(useDraftPicks){
+  const profile = computeMyStrengthsWeaknesses(useDraftPicks);
+  if(!profile) return [];
+  const n = Object.values(profile)[0].of;
+  const topCut = Math.max(1, Math.ceil(n / 3));
+  return Object.entries(profile).filter(([,e]) => e.rank > n - topCut).map(([k]) => k);
+}
 function myPositionFilled(){
   const filled = {QB:0,RB:0,WR:0,TE:0,K:0,DEF:0};
   if(!state.myRoster) return filled;
@@ -677,7 +837,141 @@ function myPositionFilled(){
   return filled;
 }
 
+/* ---------------- LIVE DRAFT STRATEGY ---------------- */
+// Reasonable default bench cushion on top of required starters, per position.
+// Not a hard rule — just what most redraft leagues actually roster.
+const BENCH_CUSHION = {QB: 1, RB: 3, WR: 3, TE: 1, K: 0, DEF: 0};
+
+function computeDraftPositionTargets(){
+  const raw = rosterPositionCounts(); // e.g. {QB:1, RB:2, WR:2, TE:1, FLEX:1, K:1, DEF:1}
+  const isSuperflex = Object.keys(raw).includes("SUPER_FLEX");
+  const starters = {QB:0, RB:0, WR:0, TE:0, K:0, DEF:0};
+  Object.entries(raw).forEach(([slot, count]) => {
+    if(["QB","RB","WR","TE","K","DEF"].includes(slot)){
+      starters[slot] += count;
+    } else {
+      // split flex-type slots evenly across their eligible positions
+      const elig = FLEX_ELIGIBLE[slot] || ["RB","WR","TE"];
+      elig.forEach(pos => { starters[pos] += count / elig.length; });
+    }
+  });
+  const cushion = {...BENCH_CUSHION};
+  if(isSuperflex) cushion.QB = 2; // superflex leagues genuinely need 2+ startable QBs
+  const target = {};
+  Object.keys(starters).forEach(pos => {
+    target[pos] = starters[pos] + (cushion[pos] || 0);
+  });
+  return {target, starters, isSuperflex};
+}
+
+function computeMyDraftNeeds(){
+  const {target, starters, isSuperflex} = computeDraftPositionTargets();
+  const drafted = {QB:0, RB:0, WR:0, TE:0, K:0, DEF:0};
+  const myRosterId = state.myRoster ? state.myRoster.roster_id : null;
+  const myPicks = (state.draftPicks || []).filter(pk => pk.roster_id === myRosterId && pk.player_id);
+  myPicks.forEach(pk => {
+    const p = state.players[pk.player_id];
+    if(p && drafted.hasOwnProperty(p.position)) drafted[p.position]++;
+  });
+  const teamsCount = (state.draftObj && state.draftObj.settings && state.draftObj.settings.teams) || (state.rosters ? state.rosters.length : 12);
+  const round = Math.floor((state.draftPicks || []).length / teamsCount) + 1;
+
+  const need = {};
+  Object.keys(target).forEach(pos => {
+    need[pos] = target[pos] - drafted[pos]; // higher = more urgently needed
+  });
+
+  // Early-round caution: don't push QB/TE priority sky-high in rounds 1-3
+  // unless the league actually requires 2 startable QBs (superflex) or
+  // 2+ TEs — that's real roster construction advice, not a fixed rule.
+  const earlyRoundPenalty = {};
+  if(round <= 3){
+    if(!isSuperflex) earlyRoundPenalty.QB = 2.5;
+    if(starters.TE < 1.5) earlyRoundPenalty.TE = 1.5;
+  }
+
+  const priority = {};
+  Object.keys(need).forEach(pos => {
+    priority[pos] = need[pos] - (earlyRoundPenalty[pos] || 0);
+  });
+
+  // Warnings: meaningfully imbalanced positions (drafted well past target
+  // while another starter-required position still sits at zero)
+  const warnings = [];
+  const zeroPositions = Object.keys(starters).filter(pos => starters[pos] >= 1 && drafted[pos] === 0);
+  Object.keys(drafted).forEach(pos => {
+    if(drafted[pos] >= Math.ceil(target[pos]) + 1 && zeroPositions.length > 0 && zeroPositions[0] !== pos){
+      warnings.push(`You've drafted ${drafted[pos]} ${pos}${drafted[pos]>1?'s':''} but still have zero ${zeroPositions.join("/")} — worth balancing soon.`);
+    }
+  });
+
+  const ranked = Object.entries(priority).filter(([pos]) => starters[pos] > 0 || drafted[pos] > 0)
+    .sort((a,b) => b[1] - a[1]);
+
+  return {target, starters, drafted, priority, round, warnings, ranked, isSuperflex};
+}
+
+function renderDraftStrategy(){
+  const wrap = document.getElementById("draftStrategyWrap");
+  if(!wrap) return;
+  if(!state.myRoster || !state.draftId || !state.draftObj){ wrap.innerHTML = ""; return; }
+  const status = state.draftObj.status;
+  if(status !== "drafting" && status !== "complete"){ wrap.innerHTML = ""; return; }
+
+  const {drafted, priority, round, warnings, ranked} = computeMyDraftNeeds();
+  const topPicks = ranked.slice(0, 2).map(([pos]) => pos);
+
+  const draftedLine = Object.entries(drafted).filter(([,c]) => c > 0)
+    .map(([pos,c]) => `${c} ${pos}`).join(", ") || "nothing yet";
+
+  const warnHtml = warnings.length
+    ? warnings.map(w => `<div class="atext" style="color:var(--amber); margin-bottom:4px;">⚠ ${w}</div>`).join("")
+    : "";
+
+  const statProfile = computeMyStrengthsWeaknesses(true); // true = compare draft picks so far, not final rosters
+  const statCard = renderStatProfileCard(statProfile, "Team Stat Profile (picks so far)");
+
+  wrap.innerHTML = `
+    <div class="alert-card" style="margin-top:12px;">
+      <div class="ahead">
+        <span class="aname">Draft Strategy — Round ${round}</span>
+        <span class="rec-tag rec-ADD">Suggest: ${topPicks.join(" or ") || "—"}</span>
+      </div>
+      <div class="atext">You've drafted: ${draftedLine}.</div>
+      ${warnHtml}
+      <div class="hint" style="margin-top:6px;">Based on your league's actual starting slots + a normal bench cushion — "Fills Need" tags below reflect this live, not just your finished roster.</div>
+    </div>
+    ${statCard}
+  `;
+}
+
 const INJURY_LABEL = {Questionable:"Q", Doubtful:"D", Out:"O", IR:"IR", PUP:"PUP", Suspended:"SUS"};
+
+const STAT_CATEGORIES = [
+  {key:"py",    label:"Pass Yds", posGroup:["QB"],           lowerIsBetter:false},
+  {key:"ptd",   label:"Pass TD",  posGroup:["QB"],           lowerIsBetter:false},
+  {key:"int",   label:"INT",      posGroup:["QB"],           lowerIsBetter:true},
+  {key:"ry",    label:"Rush Yds", posGroup:["RB","QB","WR"], lowerIsBetter:false},
+  {key:"rtd",   label:"Rush TD",  posGroup:["RB","QB","WR"], lowerIsBetter:false},
+  {key:"rec",   label:"Rec",      posGroup:["RB","WR","TE"], lowerIsBetter:false},
+  {key:"recy",  label:"Rec Yds",  posGroup:["RB","WR","TE"], lowerIsBetter:false},
+  {key:"rectd", label:"Rec TD",   posGroup:["RB","WR","TE"], lowerIsBetter:false},
+];
+
+// Builds a compact, position-relevant stat line, e.g. "3668 PY · 25 TD · 10 INT"
+function formatStatLine(stats, pos){
+  if(!stats) return "—";
+  const relevant = STAT_CATEGORIES.filter(c => c.posGroup.includes(pos) && stats[c.key] != null && stats[c.key] !== 0);
+  if(relevant.length === 0) return "—";
+  return relevant.map(c => `${stats[c.key]} ${c.label}`).join(" · ");
+}
+
+function positionMatchesFilter(pos, filter){
+  if(filter === "ALL") return true;
+  if(["QB","RB","WR","TE","K","DEF"].includes(filter)) return pos === filter;
+  const elig = FLEX_ELIGIBLE[filter] || ["RB","WR","TE"];
+  return elig.includes(pos);
+}
 
 function renderDraftBoard(){
   const wrap = document.getElementById("draftBoardWrap");
@@ -687,23 +981,24 @@ function renderDraftBoard(){
   }
   const filter = document.getElementById("draftPosFilter").value;
   const sortMode = document.getElementById("draftSortMode").value;
+  const showDrafted = document.getElementById("showDraftedToggle")?.checked;
 
   let list = Object.values(state.players)
     .filter(p => p && p.search_rank && p.search_rank < 9999)
-    .filter(p => !state.draftedIds.has(p.player_id))
-    .filter(p => filter === "ALL" || p.position === filter);
+    .filter(p => showDrafted || !state.draftedIds.has(p.player_id))
+    .filter(p => positionMatchesFilter(p.position, filter));
 
   if(sortMode === "ppg"){
     // Show proven-production players first, then rookies/no-data players by consensus
     // rank — never drop them, since a rookie with no prior-season stats is often still
     // a top-60 consensus pick and shouldn't just vanish from the board.
-    const scored = list.filter(p => p._stats && p._stats.ppg != null).sort((a,b) => b._stats.ppg - a._stats.ppg);
-    const unscored = list.filter(p => !(p._stats && p._stats.ppg != null)).sort((a,b) => a.search_rank - b.search_rank);
+    const scored = list.filter(p => displayPPG(p._stats) != null).sort((a,b) => displayPPG(b._stats) - displayPPG(a._stats));
+    const unscored = list.filter(p => displayPPG(p._stats) == null).sort((a,b) => a.search_rank - b.search_rank);
     list = [...scored, ...unscored];
   } else {
     list = list.sort((a,b) => a.search_rank - b.search_rank);
   }
-  list = list.slice(0, 60);
+  list = list.slice(0, showDrafted ? 80 : 60);
 
   if(list.length === 0){
     wrap.innerHTML = "<div class='empty'>No available players match this filter.</div>";
@@ -712,19 +1007,28 @@ function renderDraftBoard(){
 
   const filled = myPositionFilled();
   const need = rosterPositionCounts();
+  const draftIsLive = state.draftObj && (state.draftObj.status === "drafting" || state.draftObj.status === "complete");
+  const livePriority = draftIsLive ? computeMyDraftNeeds().priority : null;
 
   const rows = list.map(p => {
     const name = p.full_name || `${p.first_name||""} ${p.last_name||""}`.trim() || p.player_id;
-    const isNeed = need[p.position] && filled[p.position] < need[p.position];
+    const isDrafted = state.draftedIds.has(p.player_id);
+    const isNeed = !isDrafted && (livePriority ? (livePriority[p.position] > 0) : (need[p.position] && filled[p.position] < need[p.position]));
     const inj = p.injury_status && INJURY_LABEL[p.injury_status];
     const stats = p._stats;
     const extraTag = buildContextTag(stats);
-    return `<tr>
+    const draftedInfo = isDrafted ? (state.draftedBy[p.player_id] || null) : null;
+    const draftedTag = draftedInfo
+      ? `<span class="need-tag" style="border-color:var(--steel); color:var(--chalk-dim);">Drafted — ${draftedInfo.teamName} (${draftedInfo.round}.${draftedInfo.pickInRound})</span>`
+      : (isDrafted ? '<span class="need-tag" style="border-color:var(--steel); color:var(--chalk-dim);">Drafted</span>' : "");
+    const rowStyle = isDrafted ? ' style="opacity:0.4;"' : "";
+    const nameStyle = isDrafted ? ' style="text-decoration:line-through;"' : "";
+    return `<tr${rowStyle}>
       <td class="rank">#${p.search_rank}</td>
-      <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag}</td>
+      <td><span${nameStyle}>${name}</span> ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${draftedTag}</td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
-      <td class="rank">${stats && stats.ppg != null ? stats.ppg.toFixed(1) : "—"}</td>
+      <td class="rank">${displayPPG(stats) != null ? displayPPG(stats).toFixed(1) : "—"}</td>
       <td class="rank">${stats && stats.gp != null ? stats.gp : "—"}</td>
     </tr>`;
   }).join("");
@@ -794,6 +1098,7 @@ async function loadTrending(){
 
     const need = rosterPositionCounts();
     const filled = myPositionFilled();
+    const weakKeys = myWeakCategoryKeys(false);
 
     const rows = available.map(t => {
       const p = t.player;
@@ -802,20 +1107,25 @@ async function loadTrending(){
       const inj = p.injury_status && INJURY_LABEL[p.injury_status];
       const stats = p._stats;
       const extraTag = buildContextTag(stats);
+      const addressesWeakness = stats && weakKeys.some(k =>
+        STAT_CATEGORIES.find(c => c.key === k)?.posGroup.includes(p.position) && (stats[k] || 0) > 0
+      );
+      const weaknessTag = addressesWeakness ? '<span class="rec-tag rec-ADD">Addresses Weakness</span>' : "";
       return `<tr>
-        <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag}</td>
+        <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${weaknessTag}</td>
         <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
         <td>${p.team || "FA"}</td>
-        <td class="rank">${stats && stats.ppg != null ? stats.ppg.toFixed(1) : "—"}</td>
+        <td class="rank">${displayPPG(stats) != null ? displayPPG(stats).toFixed(1) : "—"}</td>
+        <td style="font-size:12px; color:var(--chalk-dim);">${formatStatLine(stats, p.position)}</td>
         <td class="rank">${t.count.toLocaleString()} adds</td>
       </tr>`;
     }).join("");
 
     wrap.innerHTML = `<table>
-      <thead><tr><th>Player</th><th>Pos</th><th>Team</th><th>'25 PPG</th><th>Add Volume</th></tr></thead>
+      <thead><tr><th>Player</th><th>Pos</th><th>Team</th><th>PPG</th><th>Stat Line</th><th>Add Volume</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
-    <div class="hint" style="margin-top:10px;">Auto-refreshes every 90 seconds while you're on this tab.</div>`;
+    <div class="hint" style="margin-top:10px;">Stats reflect the current season once it starts — right now that's still last season's numbers. Auto-refreshes every 90 seconds while you're on this tab.</div>`;
   } catch(e){
     wrap.innerHTML = `<div class="err">Couldn't load trending players: ${e.message}</div>`;
   }
@@ -833,7 +1143,9 @@ function renderNeeds(){
       <div class="lbl">${pos} Starters</div>
     </div>`;
   }).join("");
-  wrap.innerHTML = rows || "<div class='empty'>No starting requirements found.</div>";
+  const statProfile = computeMyStrengthsWeaknesses(false); // false = compare finished rosters
+  const statCard = renderStatProfileCard(statProfile, "Team Stat Strengths & Weaknesses");
+  wrap.innerHTML = (rows || "<div class='empty'>No starting requirements found.</div>") + statCard;
 }
 
 /* ---------------- MY TEAM ---------------- */
@@ -937,12 +1249,31 @@ const FLEX_ELIGIBLE = {
   REC_FLEX: ["WR","TE"],
 };
 
+function populateDraftPosFilterOptions(){
+  const sel = document.getElementById("draftPosFilter");
+  if(!sel || !state.league) return;
+  Array.from(sel.querySelectorAll("option[data-flex]")).forEach(o => o.remove());
+  const flexSlots = (state.league.roster_positions || [])
+    .filter(s => !["QB","RB","WR","TE","K","DEF","BN","IR","TAXI"].includes(s));
+  const seen = new Set();
+  flexSlots.forEach(slot => {
+    if(seen.has(slot)) return;
+    seen.add(slot);
+    const elig = FLEX_ELIGIBLE[slot] || ["RB","WR","TE"];
+    const opt = document.createElement("option");
+    opt.value = slot;
+    opt.textContent = `FLEX (${elig.join("/")})`;
+    opt.setAttribute("data-flex", "1");
+    sel.appendChild(opt);
+  });
+}
+
 function projectedPts(p){
   if(!p) return {val:0, label:"—", warn:null, context:""};
   const s = p._stats;
-  let base = (s && s.ppg != null) ? s.ppg : null;
+  let base = displayPPG(s);
   let warn = null;
-  if(base === null){
+  if(base == null){
     return {val:0, label:"No data", warn:"no-data", context: buildContextTag(s)};
   }
   const inj = p.injury_status;
