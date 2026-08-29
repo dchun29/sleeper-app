@@ -223,7 +223,7 @@
       </div>
       <div class="card">
         <h2>Best Available</h2>
-        <div class="desc">Ranked by Sleeper's overall player rank (a solid ADP proxy). Filter by position or by your team's biggest needs.</div>
+        <div class="desc">Ranked by Sleeper's overall player rank (a solid ADP proxy). Click any column header to sort by it. Filter by position or by your team's biggest needs.</div>
         <div class="controls-row">
           <select id="draftPosFilter" onchange="renderDraftBoard()">
             <option value="ALL">All Positions</option>
@@ -234,10 +234,6 @@
             <option value="K">K</option>
             <option value="DEF">DEF</option>
           </select>
-          <select id="draftSortMode" onchange="renderDraftBoard()">
-            <option value="rank">Sort: Consensus Rank</option>
-            <option value="ppg">Sort: 2025 Fantasy PPG</option>
-          </select>
           <label style="display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--chalk-dim); font-family:'IBM Plex Mono',monospace;">
             <input type="checkbox" id="liveDraftToggle" onchange="toggleLiveDraft()"> Live poll picks
           </label>
@@ -245,9 +241,10 @@
             <input type="checkbox" id="showDraftedToggle" onchange="renderDraftBoard()"> Show drafted
           </label>
           <button class="ghost" onclick="loadPlayers(true)">Refresh Player Pool</button>
+          <button class="ghost" onclick="resetDraftFilters()">Reset Filters</button>
         </div>
         <div id="draftStrategyWrap"></div>
-        <div class="desc" style="margin-top:-6px;">2025 PPG comes from real season stats (nflverse, open data) — it's proven production, not a projection. Consensus Rank is Sleeper's own popularity/ADP-style rank. Neither is a paid projections service (FantasyPros/PFF/ESPN); use both as inputs, not gospel.</div>
+        <div class="desc" style="margin-top:-6px;">Stats come from real season data (nflverse, open data) and are weighted using your league's actual scoring settings — not a generic projection.</div>
         <div id="draftBoardWrap"><div class="loading">Loading player pool...</div></div>
       </div>
     </div>
@@ -947,6 +944,73 @@ function renderDraftStrategy(){
 
 const INJURY_LABEL = {Questionable:"Q", Doubtful:"D", Out:"O", IR:"IR", PUP:"PUP", Suspended:"SUS"};
 
+/* ---------------- SORTABLE STAT COLUMNS (shared by Draft Board + Waiver Targets) ---------------- */
+const SORTABLE_COLUMNS = [
+  {key:"rank", label:"Rank",     defaultDir:"asc"},
+  {key:"ppg",  label:"PPG",      defaultDir:"desc"},
+  {key:"gp",   label:"GP",       defaultDir:"desc"},
+  {key:"py",   label:"Pass Yds", defaultDir:"desc"},
+  {key:"ptd",  label:"Pass TD",  defaultDir:"desc"},
+  {key:"int",  label:"INT",      defaultDir:"asc"},
+  {key:"ry",   label:"Rush Yds", defaultDir:"desc"},
+  {key:"rtd",  label:"Rush TD",  defaultDir:"desc"},
+  {key:"rec",  label:"Rec",      defaultDir:"desc"},
+  {key:"recy", label:"Rec Yds",  defaultDir:"desc"},
+  {key:"rectd",label:"Rec TD",   defaultDir:"desc"},
+  {key:"adds", label:"Add Volume", defaultDir:"desc"},
+];
+
+function statValue(p, key){
+  if(key === "rank") return p.search_rank;
+  if(key === "ppg") return displayPPG(p._stats);
+  if(key === "gp") return p._stats ? p._stats.gp : null;
+  if(key === "adds") return p._addCount != null ? p._addCount : null;
+  return p._stats ? p._stats[key] : null;
+}
+
+// Players missing a given stat always sort to the bottom, regardless of
+// direction — keeps rookies/no-data players visible instead of vanishing.
+function sortPlayersByColumn(list, key, dir){
+  const withVal = [], withoutVal = [];
+  list.forEach(p => { (statValue(p, key) == null ? withoutVal : withVal).push(p); });
+  withVal.sort((a,b) => {
+    const av = statValue(a, key), bv = statValue(b, key);
+    return dir === "asc" ? av - bv : bv - av;
+  });
+  return [...withVal, ...withoutVal];
+}
+
+state.draftSort = {key:"rank", dir:"asc"};
+state.waiverSort = {key:"adds", dir:"desc"};
+
+function setSort(tableName, key){
+  const sortState = tableName === "draft" ? state.draftSort : state.waiverSort;
+  if(sortState.key === key){
+    sortState.dir = sortState.dir === "asc" ? "desc" : "asc";
+  } else {
+    const col = SORTABLE_COLUMNS.find(c => c.key === key);
+    sortState.key = key;
+    sortState.dir = col ? col.defaultDir : "desc";
+  }
+  if(tableName === "draft") renderDraftBoard(); else renderWaiverTable();
+}
+
+function sortableTh(col, sortState, tableName){
+  const active = sortState.key === col.key;
+  const arrow = active ? (sortState.dir === "asc" ? " ▲" : " ▼") : "";
+  return `<th style="cursor:pointer; user-select:none; white-space:nowrap;" onclick="setSort('${tableName}','${col.key}')">${col.label}${arrow}</th>`;
+}
+
+// One click back to defaults — position, sort column, and Show Drafted —
+// so you're never manually undoing filters mid-draft when the clock's running.
+function resetDraftFilters(){
+  document.getElementById("draftPosFilter").value = "ALL";
+  const showDraftedEl = document.getElementById("showDraftedToggle");
+  if(showDraftedEl) showDraftedEl.checked = false;
+  state.draftSort = {key: "rank", dir: "asc"};
+  renderDraftBoard();
+}
+
 const STAT_CATEGORIES = [
   {key:"py",    label:"Pass Yds", posGroup:["QB"],           lowerIsBetter:false},
   {key:"ptd",   label:"Pass TD",  posGroup:["QB"],           lowerIsBetter:false},
@@ -980,7 +1044,6 @@ function renderDraftBoard(){
     return;
   }
   const filter = document.getElementById("draftPosFilter").value;
-  const sortMode = document.getElementById("draftSortMode").value;
   const showDrafted = document.getElementById("showDraftedToggle")?.checked;
 
   let list = Object.values(state.players)
@@ -988,16 +1051,7 @@ function renderDraftBoard(){
     .filter(p => showDrafted || !state.draftedIds.has(p.player_id))
     .filter(p => positionMatchesFilter(p.position, filter));
 
-  if(sortMode === "ppg"){
-    // Show proven-production players first, then rookies/no-data players by consensus
-    // rank — never drop them, since a rookie with no prior-season stats is often still
-    // a top-60 consensus pick and shouldn't just vanish from the board.
-    const scored = list.filter(p => displayPPG(p._stats) != null).sort((a,b) => displayPPG(b._stats) - displayPPG(a._stats));
-    const unscored = list.filter(p => displayPPG(p._stats) == null).sort((a,b) => a.search_rank - b.search_rank);
-    list = [...scored, ...unscored];
-  } else {
-    list = list.sort((a,b) => a.search_rank - b.search_rank);
-  }
+  list = sortPlayersByColumn(list, state.draftSort.key, state.draftSort.dir);
   list = list.slice(0, showDrafted ? 80 : 60);
 
   if(list.length === 0){
@@ -1023,18 +1077,32 @@ function renderDraftBoard(){
       : (isDrafted ? '<span class="need-tag" style="border-color:var(--steel); color:var(--chalk-dim);">Drafted</span>' : "");
     const rowStyle = isDrafted ? ' style="opacity:0.4;"' : "";
     const nameStyle = isDrafted ? ' style="text-decoration:line-through;"' : "";
+    const cell = (v, decimals) => v != null ? (decimals != null ? v.toFixed(decimals) : v) : "—";
     return `<tr${rowStyle}>
       <td class="rank">#${p.search_rank}</td>
       <td><span${nameStyle}>${name}</span> ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${draftedTag}</td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
-      <td class="rank">${displayPPG(stats) != null ? displayPPG(stats).toFixed(1) : "—"}</td>
-      <td class="rank">${stats && stats.gp != null ? stats.gp : "—"}</td>
+      <td class="rank">${cell(displayPPG(stats), 1)}</td>
+      <td class="rank">${cell(stats && stats.gp != null ? stats.gp : null)}</td>
+      <td class="rank">${cell(stats && stats.py)}</td>
+      <td class="rank">${cell(stats && stats.ptd)}</td>
+      <td class="rank">${cell(stats && stats.int)}</td>
+      <td class="rank">${cell(stats && stats.ry)}</td>
+      <td class="rank">${cell(stats && stats.rtd)}</td>
+      <td class="rank">${cell(stats && stats.rec)}</td>
+      <td class="rank">${cell(stats && stats.recy)}</td>
+      <td class="rank">${cell(stats && stats.rectd)}</td>
     </tr>`;
   }).join("");
 
+  const cols = SORTABLE_COLUMNS.filter(c => c.key !== "adds");
   wrap.innerHTML = `<table>
-    <thead><tr><th>Rank</th><th>Player</th><th>Pos</th><th>Team</th><th>'25 PPG</th><th>'25 GP</th></tr></thead>
+    <thead><tr>
+      <th onclick="setSort('draft','rank')" style="cursor:pointer;">Rank${state.draftSort.key==='rank'?(state.draftSort.dir==='asc'?' ▲':' ▼'):''}</th>
+      <th>Player</th><th>Pos</th><th>Team</th>
+      ${cols.filter(c=>c.key!=='rank').map(c => sortableTh(c, state.draftSort, 'draft')).join("")}
+    </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
 }
@@ -1091,44 +1159,68 @@ async function loadTrending(){
       .filter(t => t.player)
       .slice(0, 25);
 
+    available.forEach(t => { t.player._addCount = t.count; }); // for the Add Volume sort column
+    state.waiverAvailable = available;
+
     if(available.length === 0){
       wrap.innerHTML = "<div class='empty'>No trending free agents available in your league right now — check back closer to games.</div>";
       return;
     }
-
-    const need = rosterPositionCounts();
-    const filled = myPositionFilled();
-    const weakKeys = myWeakCategoryKeys(false);
-
-    const rows = available.map(t => {
-      const p = t.player;
-      const name = p.full_name || `${p.first_name||""} ${p.last_name||""}`.trim();
-      const isNeed = need[p.position] && filled[p.position] < need[p.position];
-      const inj = p.injury_status && INJURY_LABEL[p.injury_status];
-      const stats = p._stats;
-      const extraTag = buildContextTag(stats);
-      const addressesWeakness = stats && weakKeys.some(k =>
-        STAT_CATEGORIES.find(c => c.key === k)?.posGroup.includes(p.position) && (stats[k] || 0) > 0
-      );
-      const weaknessTag = addressesWeakness ? '<span class="rec-tag rec-ADD">Addresses Weakness</span>' : "";
-      return `<tr>
-        <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${weaknessTag}</td>
-        <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
-        <td>${p.team || "FA"}</td>
-        <td class="rank">${displayPPG(stats) != null ? displayPPG(stats).toFixed(1) : "—"}</td>
-        <td style="font-size:12px; color:var(--chalk-dim);">${formatStatLine(stats, p.position)}</td>
-        <td class="rank">${t.count.toLocaleString()} adds</td>
-      </tr>`;
-    }).join("");
-
-    wrap.innerHTML = `<table>
-      <thead><tr><th>Player</th><th>Pos</th><th>Team</th><th>PPG</th><th>Stat Line</th><th>Add Volume</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
-    <div class="hint" style="margin-top:10px;">Stats reflect the current season once it starts — right now that's still last season's numbers. Auto-refreshes every 90 seconds while you're on this tab.</div>`;
+    renderWaiverTable();
   } catch(e){
     wrap.innerHTML = `<div class="err">Couldn't load trending players: ${e.message}</div>`;
   }
+}
+
+function renderWaiverTable(){
+  const wrap = document.getElementById("waiverWrap");
+  const available = state.waiverAvailable || [];
+  if(available.length === 0) return;
+
+  const need = rosterPositionCounts();
+  const filled = myPositionFilled();
+  const weakKeys = myWeakCategoryKeys(false);
+
+  const sorted = sortPlayersByColumn(available.map(t => t.player), state.waiverSort.key, state.waiverSort.dir);
+
+  const rows = sorted.map(p => {
+    const t = available.find(x => x.player === p);
+    const name = p.full_name || `${p.first_name||""} ${p.last_name||""}`.trim();
+    const isNeed = need[p.position] && filled[p.position] < need[p.position];
+    const inj = p.injury_status && INJURY_LABEL[p.injury_status];
+    const stats = p._stats;
+    const extraTag = buildContextTag(stats);
+    const addressesWeakness = stats && weakKeys.some(k =>
+      STAT_CATEGORIES.find(c => c.key === k)?.posGroup.includes(p.position) && (stats[k] || 0) > 0
+    );
+    const weaknessTag = addressesWeakness ? '<span class="rec-tag rec-ADD">Addresses Weakness</span>' : "";
+    const cell = (v, decimals) => v != null ? (decimals != null ? v.toFixed(decimals) : v) : "—";
+    return `<tr>
+      <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${weaknessTag}</td>
+      <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
+      <td>${p.team || "FA"}</td>
+      <td class="rank">${cell(displayPPG(stats), 1)}</td>
+      <td class="rank">${cell(stats && stats.py)}</td>
+      <td class="rank">${cell(stats && stats.ptd)}</td>
+      <td class="rank">${cell(stats && stats.int)}</td>
+      <td class="rank">${cell(stats && stats.ry)}</td>
+      <td class="rank">${cell(stats && stats.rtd)}</td>
+      <td class="rank">${cell(stats && stats.rec)}</td>
+      <td class="rank">${cell(stats && stats.recy)}</td>
+      <td class="rank">${cell(stats && stats.rectd)}</td>
+      <td class="rank">${(t?.count || 0).toLocaleString()}</td>
+    </tr>`;
+  }).join("");
+
+  const cols = SORTABLE_COLUMNS.filter(c => c.key !== "rank" && c.key !== "gp");
+  wrap.innerHTML = `<table>
+    <thead><tr>
+      <th>Player</th><th>Pos</th><th>Team</th>
+      ${cols.map(c => sortableTh(c, state.waiverSort, "waiver")).join("")}
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <div class="hint" style="margin-top:10px;">Stats reflect the current season once it starts — right now that's still last season's numbers. Auto-refreshes every 90 seconds while you're on this tab.</div>`;
 }
 
 function renderNeeds(){
