@@ -369,6 +369,45 @@ let SEASON_STATS = FALLBACK_STATS;
 let SEASON_STATS_YEAR = 2025;
 let liveStatsLoaded = false;
 let liveStatsGeneratedAt = null;
+
+// Sleeper's own gsis_id field is unreliable for a meaningful chunk of players
+// (confirmed: it's null for players like Jonathan Taylor even though he's a
+// clear starter) — so the primary join is by ID when available, with a
+// name+position match as a required fallback, not an edge case.
+let STATS_BY_NAME = {};
+
+function normName(name){
+  if(!name) return "";
+  return name.toLowerCase()
+    .replace(/[.']/g, "")
+    .replace(/\b(jr|sr|ii|iii|iv|v)\b/g, "")
+    .replace(/[^a-z ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildStatsByName(){
+  STATS_BY_NAME = {};
+  Object.values(SEASON_STATS).forEach(entry => {
+    if(!entry || !entry.n || !entry.p) return;
+    const key = normName(entry.n) + "|" + entry.p;
+    // if two players share a normalized name+position, keep whichever has more data
+    const existing = STATS_BY_NAME[key];
+    if(!existing || (entry.ppg != null && existing.ppg == null)){
+      STATS_BY_NAME[key] = entry;
+    }
+  });
+}
+buildStatsByName();
+
+function lookupStats(p){
+  if(!p) return undefined;
+  if(p.gsis_id && SEASON_STATS[p.gsis_id]) return SEASON_STATS[p.gsis_id];
+  const fullName = p.full_name || `${p.first_name||""} ${p.last_name||""}`.trim();
+  const key = normName(fullName) + "|" + p.position;
+  return STATS_BY_NAME[key];
+}
+
 let state = {
   username: null, userId: null, season: "2026",
   league: null, leagueId: null, rosters: [], leagueUsers: [],
@@ -520,10 +559,11 @@ async function loadLiveStats(silent){
     SEASON_STATS_YEAR = data.season;
     liveStatsLoaded = true;
     liveStatsGeneratedAt = data.generated_at;
+    buildStatsByName();
 
     // re-join stats onto already-loaded player pool
     Object.values(state.players).forEach(p => {
-      p._stats = (p && p.gsis_id && SEASON_STATS[p.gsis_id]) ? SEASON_STATS[p.gsis_id] : undefined;
+      p._stats = lookupStats(p);
     });
 
     if(statusEl){
@@ -556,11 +596,10 @@ async function loadPlayers(force){
     ));
     state.players = {};
     results.forEach(obj => Object.assign(state.players, obj));
-    // Join in real 2024 production data via gsis_id crosswalk
+    // Join real production/draft-capital/depth-chart data — prefer gsis_id
+    // when Sleeper has it, fall back to name+position match otherwise.
     Object.values(state.players).forEach(p => {
-      if(p && p.gsis_id && SEASON_STATS[p.gsis_id]){
-        p._stats = SEASON_STATS[p.gsis_id];
-      }
+      p._stats = lookupStats(p);
     });
     renderDraftBoard();
   } catch(e){
