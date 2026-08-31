@@ -113,6 +113,7 @@
     overflow-x: auto; -webkit-overflow-scrolling: touch;
   }
   table { min-width: 460px; }
+  .player-cell { min-width: 190px; max-width: 260px; }
   @media(max-width:480px){
     .wrap{padding:16px 12px 60px;}
     .hero{padding:18px 16px;}
@@ -1093,11 +1094,11 @@ function renderDraftBoard(){
       ? `<span class="need-tag" style="border-color:var(--steel); color:var(--chalk-dim);">Drafted — ${draftedInfo.teamName} (${draftedInfo.round}.${draftedInfo.pickInRound})</span>`
       : (isDrafted ? '<span class="need-tag" style="border-color:var(--steel); color:var(--chalk-dim);">Drafted</span>' : "");
     const rowStyle = isDrafted ? ' style="opacity:0.4;"' : "";
-    const nameStyle = isDrafted ? ' style="text-decoration:line-through;"' : "";
+    const nameStyle = isDrafted ? ' style="text-decoration:line-through; white-space:nowrap;"' : ' style="white-space:nowrap;"';
     const cell = (v, decimals) => v != null ? (decimals != null ? v.toFixed(decimals) : v) : "—";
     return `<tr${rowStyle}>
       <td class="rank">#${p.search_rank}</td>
-      <td><span${nameStyle}>${name}</span> ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${draftedTag}</td>
+      <td class="player-cell"><span${nameStyle}>${name}</span> ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${draftedTag}</td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
       <td class="rank">${cell(displayPPG(stats), 1)}</td>
@@ -1219,7 +1220,7 @@ function renderWaiverTable(){
     const weaknessTag = addressesWeakness ? '<span class="rec-tag rec-ADD">Addresses Weakness</span>' : "";
     const cell = (v, decimals) => v != null ? (decimals != null ? v.toFixed(decimals) : v) : "—";
     return `<tr>
-      <td>${name} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${weaknessTag}</td>
+      <td class="player-cell"><span style="white-space:nowrap;">${name}</span> ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${weaknessTag}</td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
       <td class="rank">${cell(displayPPG(stats), 1)}</td>
