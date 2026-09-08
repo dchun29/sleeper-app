@@ -250,7 +250,7 @@
           <button class="ghost" onclick="resetDraftFilters()">Reset Filters</button>
         </div>
         <div id="draftStrategyWrap"></div>
-        <div class="desc" style="margin-top:-6px;">Stats come from real season data (nflverse, open data) and are weighted using your league's actual scoring settings — not a generic projection.</div>
+        <div class="desc" style="margin-top:-6px;">Stats come from real season data (nflverse, open data) and are weighted using your league's actual scoring settings — not a generic projection. Value Score blends this with target share/CPOE; for rookies with no prior-season stats, it's estimated from how similarly-consensus-ranked veterans actually perform, shown in italic amber with a "~" — never confused with real production.</div>
         <div id="draftBoardWrap"><div class="loading">Loading player pool...</div></div>
       </div>
     </div>
@@ -747,6 +747,7 @@ function annotateLeaguePPG(){
       p._stats.leaguePPG = leagueScoredPPG(p._stats, p.position);
     }
   });
+  state._scoreCurveCache = null; // stats changed — rebuild the rank-to-score curve next use
 }
 
 // Preferred PPG for display/sort: league-weighted when available, otherwise
@@ -975,7 +976,42 @@ const SORTABLE_COLUMNS = [
 // for pass-catchers, CPOE for QBs — into one default ranking. This is the
 // actual "does the offense trust this player" signal baked into the sort,
 // not just a separate column you have to remember to check.
-function computeValueScore(p){
+// Builds a curve of {rank, score} from every player who HAS real production
+// data, sorted by Sleeper's consensus rank. Lets us answer "what do players
+// ranked around here actually score?" — which is exactly what a rookie with
+// zero NFL snaps needs, instead of just getting excluded.
+function buildRankToScoreCurve(){
+  const pts = [];
+  Object.values(state.players).forEach(pl => {
+    const raw = rawValueScore(pl);
+    if(raw != null && pl.search_rank) pts.push({rank: pl.search_rank, score: raw});
+  });
+  pts.sort((a,b) => a.rank - b.rank);
+  return pts;
+}
+
+function getScoreCurve(){
+  if(!state._scoreCurveCache) state._scoreCurveCache = buildRankToScoreCurve();
+  return state._scoreCurveCache;
+}
+
+function estimateScoreFromRank(rank, curve){
+  if(!curve || curve.length === 0 || rank == null) return null;
+  if(rank <= curve[0].rank) return curve[0].score;
+  if(rank >= curve[curve.length-1].rank) return curve[curve.length-1].score;
+  for(let i = 0; i < curve.length - 1; i++){
+    const a = curve[i], b = curve[i+1];
+    if(rank >= a.rank && rank <= b.rank){
+      if(b.rank === a.rank) return a.score;
+      const t = (rank - a.rank) / (b.rank - a.rank);
+      return a.score + t * (b.score - a.score);
+    }
+  }
+  return curve[curve.length-1].score;
+}
+
+// The "real" score when actual production data exists — no estimation.
+function rawValueScore(p){
   const s = p._stats;
   const ppg = displayPPG(s);
   if(ppg == null) return null;
@@ -989,8 +1025,31 @@ function computeValueScore(p){
   return ppg + bonus;
 }
 
+// Full Value Score: real production when it exists, otherwise a principled
+// estimate from consensus-rank peers plus a small bump for confirmed
+// opportunity (depth chart starter, early draft capital). Always returns
+// {value, estimated} so the UI can mark estimates clearly — never presented
+// as if it were real production.
+function computeValueScore(p){
+  const raw = rawValueScore(p);
+  if(raw != null) return {value: raw, estimated: false};
+
+  const curve = getScoreCurve();
+  const est = estimateScoreFromRank(p.search_rank, curve);
+  if(est == null) return {value: null, estimated: false};
+
+  const s = p._stats;
+  let bump = 0;
+  if(s && s.dr === 1) bump += 2;              // confirmed depth-chart starter
+  if(s && s.dc){
+    if(s.dc.rd === 1) bump += 1.5;
+    else if(s.dc.rd === 2) bump += 0.75;
+  }
+  return {value: est + bump, estimated: true};
+}
+
 function statValue(p, key){
-  if(key === "score") return computeValueScore(p);
+  if(key === "score") return computeValueScore(p).value;
   if(key === "rank") return p.search_rank;
   if(key === "ppg") return displayPPG(p._stats);
   if(key === "gp") return p._stats ? p._stats.gp : null;
@@ -1083,6 +1142,14 @@ function formatSize(p){
   return `${heightStr} / ${weightStr}`;
 }
 
+function formatValueScore(p){
+  const vs = computeValueScore(p);
+  if(vs.value == null) return "—";
+  return vs.estimated
+    ? `<span style="color:var(--amber); opacity:0.75; font-style:italic;" title="Estimated from consensus rank + draft capital/depth chart — no production data yet">~${vs.value.toFixed(1)}</span>`
+    : `<span style="color:var(--amber); font-weight:600;">${vs.value.toFixed(1)}</span>`;
+}
+
 function renderDraftBoard(){
   const wrap = document.getElementById("draftBoardWrap");
   if(!state.players || Object.keys(state.players).length === 0){
@@ -1132,7 +1199,7 @@ function renderDraftBoard(){
       </td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
-      <td class="rank" style="color:var(--amber); font-weight:600;">${cell(computeValueScore(p), 1)}</td>
+      <td class="rank">${formatValueScore(p)}</td>
       <td class="rank">${cell(displayPPG(stats), 1)}</td>
       <td class="rank">${cell(stats && stats.gp != null ? stats.gp : null)}</td>
       <td class="rank">${cell(stats && stats.cp, 1)}</td>
@@ -1256,7 +1323,7 @@ function renderWaiverTable(){
       </td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
-      <td class="rank" style="color:var(--amber); font-weight:600;">${cell(computeValueScore(p), 1)}</td>
+      <td class="rank">${formatValueScore(p)}</td>
       <td class="rank">${cell(displayPPG(stats), 1)}</td>
       <td class="rank">${cell(stats && stats.cp, 1)}</td>
       <td class="rank">${cell(stats && stats.cpoe, 1)}</td>
