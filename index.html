@@ -246,11 +246,14 @@
           <label style="display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--chalk-dim); font-family:'IBM Plex Mono',monospace;">
             <input type="checkbox" id="showDraftedToggle" onchange="renderDraftBoard()"> Show drafted
           </label>
+          <label style="display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--chalk-dim); font-family:'IBM Plex Mono',monospace;">
+            <input type="checkbox" id="waitOnQBToggle" checked onchange="toggleWaitOnQB()"> Wait on QB
+          </label>
           <button class="ghost" onclick="loadPlayers(true)">Refresh Player Pool</button>
           <button class="ghost" onclick="resetDraftFilters()">Reset Filters</button>
         </div>
         <div id="draftStrategyWrap"></div>
-        <div class="desc" style="margin-top:-6px;">Stats come from real season data (nflverse, open data) and are weighted using your league's actual scoring settings — not a generic projection. Value Score blends this with target share/CPOE; for rookies with no prior-season stats, it's estimated from how similarly-consensus-ranked veterans actually perform, shown in italic amber with a "~" — never confused with real production.</div>
+        <div class="desc" style="margin-top:-6px;">Stats come from real season data (nflverse, open data) and are weighted using your league's actual scoring settings — not a generic projection. Value Score blends this with target share/CPOE and a light strength-of-schedule adjustment (SOS: 0=toughest, 100=easiest, based on this season's actual matchups vs. how defenses performed last year — kept small since matchups mostly average out over a full season). For rookies with no prior-season stats, it's estimated from how similarly-consensus-ranked veterans actually perform, shown in italic amber with a "~" — never confused with real production.</div>
         <div id="draftBoardWrap"><div class="loading">Loading player pool...</div></div>
       </div>
     </div>
@@ -885,14 +888,15 @@ function computeMyDraftNeeds(){
     need[pos] = target[pos] - drafted[pos]; // higher = more urgently needed
   });
 
-  // Early-round caution: don't push QB/TE priority sky-high in rounds 1-3
-  // unless the league actually requires 2 startable QBs (superflex) or
-  // 2+ TEs — that's real roster construction advice, not a fixed rule.
+  // Early-round caution: don't push QB/TE priority sky-high early on unless
+  // the league actually requires 2 startable QBs (superflex) or 2+ TEs.
+  // "Wait on QB" (on by default) extends this through round 8, matching a
+  // deliberate late-round-QB strategy — QB depth runs deep in single-QB
+  // leagues, so paying an early pick for one is rarely the best value.
+  const qbWaitRound = state.waitOnQB !== false ? 8 : 3;
   const earlyRoundPenalty = {};
-  if(round <= 3){
-    if(!isSuperflex) earlyRoundPenalty.QB = 2.5;
-    if(starters.TE < 1.5) earlyRoundPenalty.TE = 1.5;
-  }
+  if(!isSuperflex && round <= qbWaitRound) earlyRoundPenalty.QB = 2.5;
+  if(round <= 3 && starters.TE < 1.5) earlyRoundPenalty.TE = 1.5;
 
   const priority = {};
   Object.keys(need).forEach(pos => {
@@ -915,12 +919,32 @@ function computeMyDraftNeeds(){
   return {target, starters, drafted, priority, round, warnings, ranked, isSuperflex};
 }
 
+// Combines proven/estimated Value Score with live positional need to surface
+// a single concrete "draft this player" recommendation, not just a position
+// suggestion. Need is weighted meaningfully but doesn't override a clearly
+// better player at a slightly-less-needed position.
+function computeRecommendedPick(){
+  if(!state.draftObj || state.draftObj.status !== "drafting") return null;
+  const {priority} = computeMyDraftNeeds();
+  const candidates = Object.values(state.players)
+    .filter(p => p && p.search_rank && p.search_rank < 9999 && p.team)
+    .filter(p => !state.draftedIds.has(p.player_id))
+    .map(p => {
+      const vs = computeValueScore(p);
+      const needBoost = (priority[p.position] || 0) * 1.2;
+      return {p, combined: (vs.value || 0) + needBoost, vs};
+    })
+    .sort((a,b) => b.combined - a.combined);
+  if(candidates.length === 0) return null;
+  return {pick: candidates[0], alternates: candidates.slice(1, 4)};
+}
+
 function renderDraftStrategy(){
   const wrap = document.getElementById("draftStrategyWrap");
   if(!wrap) return;
-  if(!state.myRoster || !state.draftId || !state.draftObj){ wrap.innerHTML = ""; return; }
+  if(!state.myRoster || !state.draftId || !state.draftObj){ wrap.innerHTML = ""; state._recommendedPickId = null; return; }
   const status = state.draftObj.status;
-  if(status !== "drafting" && status !== "complete"){ wrap.innerHTML = ""; return; }
+  if(status !== "drafting" && status !== "complete"){ wrap.innerHTML = ""; state._recommendedPickId = null; return; }
 
   const {drafted, priority, round, warnings, ranked} = computeMyDraftNeeds();
   const topPicks = ranked.slice(0, 2).map(([pos]) => pos);
@@ -931,6 +955,21 @@ function renderDraftStrategy(){
   const warnHtml = warnings.length
     ? warnings.map(w => `<div class="atext" style="color:var(--amber); margin-bottom:4px;">⚠ ${w}</div>`).join("")
     : "";
+
+  const rec = computeRecommendedPick();
+  state._recommendedPickId = rec ? rec.pick.p.player_id : null;
+  const recHtml = rec ? `
+    <div class="alert-card" style="margin-top:12px; border-color:var(--turf-bright); background:rgba(64,145,108,0.08);">
+      <div class="ahead">
+        <span class="aname">★ The Pick: ${rec.pick.p.full_name || rec.pick.p.player_id}
+          <span class="pos-badge pos-${rec.pick.p.position}">${rec.pick.p.position}</span>
+          <span style="color:var(--chalk-dim); font-size:12px;">${rec.pick.p.team}</span>
+        </span>
+        <span class="rec-tag rec-ADD">${rec.pick.vs.estimated ? "~" : ""}${rec.pick.vs.value != null ? rec.pick.vs.value.toFixed(1) : "—"} Value</span>
+      </div>
+      <div class="atext">Best combination of team need and player quality available right now — highlighted below on the board too.</div>
+      ${rec.alternates.length ? `<div class="atext" style="margin-top:4px; color:var(--chalk-dim);">Also in the mix: ${rec.alternates.map(a => a.p.full_name || a.p.player_id).join(", ")}</div>` : ""}
+    </div>` : "";
 
   const statProfile = computeMyStrengthsWeaknesses(true); // true = compare draft picks so far, not final rosters
   const statCard = renderStatProfileCard(statProfile, "Team Stat Profile (picks so far)");
@@ -943,8 +982,9 @@ function renderDraftStrategy(){
       </div>
       <div class="atext">You've drafted: ${draftedLine}.</div>
       ${warnHtml}
-      <div class="hint" style="margin-top:6px;">Based on your league's actual starting slots + a normal bench cushion — "Fills Need" tags below reflect this live, not just your finished roster.</div>
+      <div class="hint" style="margin-top:6px;">Based on your league's actual starting slots + a normal bench cushion — "Fills Need" tags below reflect this live, not just your finished roster.${state.waitOnQB ? " QB priority is deliberately suppressed through round 8 (Wait on QB is on)." : ""}</div>
     </div>
+    ${recHtml}
     ${statCard}
   `;
 }
@@ -969,30 +1009,30 @@ const SORTABLE_COLUMNS = [
   {key:"rec",  label:"Rec",      defaultDir:"desc"},
   {key:"recy", label:"Rec Yds",  defaultDir:"desc"},
   {key:"rectd",label:"Rec TD",   defaultDir:"desc"},
+  {key:"sos",  label:"SOS",      defaultDir:"desc"},
   {key:"adds", label:"Add Volume", defaultDir:"desc"},
 ];
 
-// Blends proven production (PPG) with real opportunity signal — target share
-// for pass-catchers, CPOE for QBs — into one default ranking. This is the
-// actual "does the offense trust this player" signal baked into the sort,
-// not just a separate column you have to remember to check.
-// Builds a curve of {rank, score} from every player who HAS real production
-// data, sorted by Sleeper's consensus rank. Lets us answer "what do players
-// ranked around here actually score?" — which is exactly what a rookie with
-// zero NFL snaps needs, instead of just getting excluded.
-function buildRankToScoreCurve(){
-  const pts = [];
+// Builds a SEPARATE curve per position (QB/RB/WR/TE) of {rank, score} from
+// every player at that position who HAS real production data, sorted by
+// Sleeper's consensus rank. Must be per-position: QBs and elite RBs score
+// far more PPG than WRs at similar overall consensus rank, so a single mixed
+// curve would badly inflate rookie WR/TE estimates by comparing them against
+// nearby-ranked players at completely different positions.
+function buildRankToScoreCurves(){
+  const curves = {QB: [], RB: [], WR: [], TE: []};
   Object.values(state.players).forEach(pl => {
+    if(!curves[pl.position]) return;
     const raw = rawValueScore(pl);
-    if(raw != null && pl.search_rank) pts.push({rank: pl.search_rank, score: raw});
+    if(raw != null && pl.search_rank) curves[pl.position].push({rank: pl.search_rank, score: raw});
   });
-  pts.sort((a,b) => a.rank - b.rank);
-  return pts;
+  Object.values(curves).forEach(c => c.sort((a,b) => a.rank - b.rank));
+  return curves;
 }
 
-function getScoreCurve(){
-  if(!state._scoreCurveCache) state._scoreCurveCache = buildRankToScoreCurve();
-  return state._scoreCurveCache;
+function getScoreCurve(position){
+  if(!state._scoreCurveCache) state._scoreCurveCache = buildRankToScoreCurves();
+  return state._scoreCurveCache[position] || [];
 }
 
 function estimateScoreFromRank(rank, curve){
@@ -1022,25 +1062,37 @@ function rawValueScore(p){
   if(s && s.cpoe != null && p.position === "QB"){
     bonus += s.cpoe * 0.3; // CPOE typically ranges roughly -10 to +10
   }
+  if(s && s.sos != null){
+    // Deliberately small: over a full season, matchup difficulty mostly
+    // averages out. Max swing here is about ±1 point — a light tiebreaker,
+    // not a major factor. Week-to-week matchups matter far more and are
+    // handled separately by the Lineup Optimizer.
+    bonus += (s.sos - 50) / 50 * 1.0;
+  }
   return ppg + bonus;
 }
 
 // Full Value Score: real production when it exists, otherwise a principled
-// estimate from consensus-rank peers plus a small bump for confirmed
-// opportunity (depth chart starter, early draft capital). Always returns
-// {value, estimated} so the UI can mark estimates clearly — never presented
-// as if it were real production.
+// estimate from SAME-POSITION consensus-rank peers plus a small bump for
+// confirmed opportunity (depth chart starter, early draft capital). Always
+// returns {value, estimated} so the UI can mark estimates clearly — never
+// presented as if it were real production.
+//
+// Known real limitation: the depth-chart "starter" signal comes from
+// nflverse's automated tracker, which can disagree with actual reported news
+// (it's occasionally wrong or lags real beat-reporter updates) — treat it as
+// one input, not a confirmed fact, especially for very recent roster moves.
 function computeValueScore(p){
   const raw = rawValueScore(p);
   if(raw != null) return {value: raw, estimated: false};
 
-  const curve = getScoreCurve();
+  const curve = getScoreCurve(p.position);
   const est = estimateScoreFromRank(p.search_rank, curve);
   if(est == null) return {value: null, estimated: false};
 
   const s = p._stats;
   let bump = 0;
-  if(s && s.dr === 1) bump += 2;              // confirmed depth-chart starter
+  if(s && s.dr === 1) bump += 2;              // confirmed depth-chart starter (see caveat above)
   if(s && s.dc){
     if(s.dc.rd === 1) bump += 1.5;
     else if(s.dc.rd === 2) bump += 0.75;
@@ -1073,6 +1125,7 @@ function sortPlayersByColumn(list, key, dir){
 }
 
 state.draftSort = {key:"score", dir:"desc"};
+state.waitOnQB = true;
 state.waiverSort = {key:"score", dir:"desc"};
 
 function setSort(tableName, key){
@@ -1099,7 +1152,16 @@ function resetDraftFilters(){
   document.getElementById("draftPosFilter").value = "ALL";
   const showDraftedEl = document.getElementById("showDraftedToggle");
   if(showDraftedEl) showDraftedEl.checked = false;
+  const waitOnQBEl = document.getElementById("waitOnQBToggle");
+  if(waitOnQBEl) waitOnQBEl.checked = true;
+  state.waitOnQB = true;
   state.draftSort = {key: "score", dir: "desc"};
+  renderDraftBoard();
+}
+
+function toggleWaitOnQB(){
+  state.waitOnQB = document.getElementById("waitOnQBToggle").checked;
+  renderDraftStrategy();
   renderDraftBoard();
 }
 
@@ -1161,6 +1223,7 @@ function renderDraftBoard(){
 
   let list = Object.values(state.players)
     .filter(p => p && p.search_rank && p.search_rank < 9999)
+    .filter(p => p.team) // exclude true free agents — no NFL team means no realistic path to relevance
     .filter(p => showDrafted || !state.draftedIds.has(p.player_id))
     .filter(p => positionMatchesFilter(p.position, filter));
 
@@ -1188,14 +1251,16 @@ function renderDraftBoard(){
     const draftedTag = draftedInfo
       ? `<span class="need-tag" style="border-color:var(--steel); color:var(--chalk-dim);">Drafted — ${draftedInfo.teamName} (${draftedInfo.round}.${draftedInfo.pickInRound})</span>`
       : (isDrafted ? '<span class="need-tag" style="border-color:var(--steel); color:var(--chalk-dim);">Drafted</span>' : "");
-    const rowStyle = isDrafted ? ' style="opacity:0.4;"' : "";
+    const isRecommended = state._recommendedPickId === p.player_id;
+    const rowStyle = isDrafted ? ' style="opacity:0.4;"' : (isRecommended ? ' style="background:rgba(64,145,108,0.12); box-shadow:inset 3px 0 0 var(--turf-bright);"' : "");
+    const recTag = isRecommended ? '<span class="rec-tag rec-ADD">★ The Pick</span>' : "";
     const nameStyle = isDrafted ? ' style="text-decoration:line-through; white-space:nowrap;"' : ' style="white-space:nowrap;"';
     const cell = (v, decimals) => v != null ? (decimals != null ? v.toFixed(decimals) : v) : "—";
     return `<tr${rowStyle}>
       <td class="rank rank-cell">#${p.search_rank}</td>
       <td class="player-cell player-cell-draft">
         <span class="player-name-line"${nameStyle}>${name}</span>
-        <div class="player-tags-line">${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${draftedTag}</div>
+        <div class="player-tags-line">${recTag} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${draftedTag}</div>
       </td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
@@ -1214,6 +1279,7 @@ function renderDraftBoard(){
       <td class="rank">${cell(stats && stats.rec)}</td>
       <td class="rank">${cell(stats && stats.recy)}</td>
       <td class="rank">${cell(stats && stats.rectd)}</td>
+      <td class="rank">${cell(stats && stats.sos, 0)}</td>
     </tr>`;
   }).join("");
 
@@ -1277,7 +1343,7 @@ async function loadTrending(){
     const available = trending
       .filter(t => !state.rosteredIds.has(t.player_id))
       .map(t => ({...t, player: state.players[t.player_id]}))
-      .filter(t => t.player)
+      .filter(t => t.player && t.player.team) // exclude true free agents
       .slice(0, 25);
 
     available.forEach(t => { t.player._addCount = t.count; }); // for the Add Volume sort column
@@ -1337,6 +1403,7 @@ function renderWaiverTable(){
       <td class="rank">${cell(stats && stats.rec)}</td>
       <td class="rank">${cell(stats && stats.recy)}</td>
       <td class="rank">${cell(stats && stats.rectd)}</td>
+      <td class="rank">${cell(stats && stats.sos, 0)}</td>
       <td class="rank">${(t?.count || 0).toLocaleString()}</td>
     </tr>`;
   }).join("");
