@@ -113,7 +113,10 @@
     overflow-x: auto; -webkit-overflow-scrolling: touch;
   }
   table { min-width: 460px; }
-  .player-cell { min-width: 190px; max-width: 260px; }
+  .player-cell { position: sticky; z-index: 2; background: var(--panel-2); min-width: 190px; max-width: 260px; }
+  .player-cell-draft { left: 52px; }
+  .player-cell-waiver { left: 0; }
+  .rank-cell { position: sticky; left: 0; z-index: 3; background: var(--panel-2); width: 52px; min-width: 52px; max-width: 52px; }
   @media(max-width:480px){
     .wrap{padding:16px 12px 60px;}
     .hero{padding:18px 16px;}
@@ -149,8 +152,10 @@
   .rank{font-family:'IBM Plex Mono',monospace; color:var(--chalk-dim);}
   .need-tag{
     font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; color:var(--amber);
-    border:1px solid var(--amber); border-radius:4px; padding:1px 6px; margin-left:6px;
+    border:1px solid var(--amber); border-radius:4px; padding:2px 6px; margin:2px 4px 2px 0; display:inline-block; line-height:1.4;
   }
+  .player-name-line{ font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; display:block; margin-bottom:3px; }
+  .player-tags-line{ display:flex; flex-wrap:wrap; gap:2px; }
   select{
     background:var(--panel-2); border:1px solid var(--steel); color:var(--chalk); padding:9px 12px; border-radius:7px;
     font-family:'Inter',sans-serif; font-size:13px;
@@ -947,6 +952,7 @@ const INJURY_LABEL = {Questionable:"Q", Doubtful:"D", Out:"O", IR:"IR", PUP:"PUP
 
 /* ---------------- SORTABLE STAT COLUMNS (shared by Draft Board + Waiver Targets) ---------------- */
 const SORTABLE_COLUMNS = [
+  {key:"score", label:"Value Score", defaultDir:"desc"},
   {key:"rank", label:"Rank",     defaultDir:"asc"},
   {key:"ppg",  label:"PPG",      defaultDir:"desc"},
   {key:"gp",   label:"GP",       defaultDir:"desc"},
@@ -965,7 +971,26 @@ const SORTABLE_COLUMNS = [
   {key:"adds", label:"Add Volume", defaultDir:"desc"},
 ];
 
+// Blends proven production (PPG) with real opportunity signal — target share
+// for pass-catchers, CPOE for QBs — into one default ranking. This is the
+// actual "does the offense trust this player" signal baked into the sort,
+// not just a separate column you have to remember to check.
+function computeValueScore(p){
+  const s = p._stats;
+  const ppg = displayPPG(s);
+  if(ppg == null) return null;
+  let bonus = 0;
+  if(s && s.tgtshare != null && ["RB","WR","TE"].includes(p.position)){
+    bonus += s.tgtshare * 0.15; // target share is 0-100; modest weight vs. real scoring
+  }
+  if(s && s.cpoe != null && p.position === "QB"){
+    bonus += s.cpoe * 0.3; // CPOE typically ranges roughly -10 to +10
+  }
+  return ppg + bonus;
+}
+
 function statValue(p, key){
+  if(key === "score") return computeValueScore(p);
   if(key === "rank") return p.search_rank;
   if(key === "ppg") return displayPPG(p._stats);
   if(key === "gp") return p._stats ? p._stats.gp : null;
@@ -982,11 +1007,14 @@ function sortPlayersByColumn(list, key, dir){
     const av = statValue(a, key), bv = statValue(b, key);
     return dir === "asc" ? av - bv : bv - av;
   });
+  // Within the "no value for this stat" group, fall back to consensus rank
+  // so rookies/no-data players are still in a sensible order, not random.
+  withoutVal.sort((a,b) => (a.search_rank||9999) - (b.search_rank||9999));
   return [...withVal, ...withoutVal];
 }
 
-state.draftSort = {key:"rank", dir:"asc"};
-state.waiverSort = {key:"adds", dir:"desc"};
+state.draftSort = {key:"score", dir:"desc"};
+state.waiverSort = {key:"score", dir:"desc"};
 
 function setSort(tableName, key){
   const sortState = tableName === "draft" ? state.draftSort : state.waiverSort;
@@ -1012,7 +1040,7 @@ function resetDraftFilters(){
   document.getElementById("draftPosFilter").value = "ALL";
   const showDraftedEl = document.getElementById("showDraftedToggle");
   if(showDraftedEl) showDraftedEl.checked = false;
-  state.draftSort = {key: "rank", dir: "asc"};
+  state.draftSort = {key: "score", dir: "desc"};
   renderDraftBoard();
 }
 
@@ -1097,10 +1125,14 @@ function renderDraftBoard(){
     const nameStyle = isDrafted ? ' style="text-decoration:line-through; white-space:nowrap;"' : ' style="white-space:nowrap;"';
     const cell = (v, decimals) => v != null ? (decimals != null ? v.toFixed(decimals) : v) : "—";
     return `<tr${rowStyle}>
-      <td class="rank">#${p.search_rank}</td>
-      <td class="player-cell"><span${nameStyle}>${name}</span> ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${draftedTag}</td>
+      <td class="rank rank-cell">#${p.search_rank}</td>
+      <td class="player-cell player-cell-draft">
+        <span class="player-name-line"${nameStyle}>${name}</span>
+        <div class="player-tags-line">${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${draftedTag}</div>
+      </td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
+      <td class="rank" style="color:var(--amber); font-weight:600;">${cell(computeValueScore(p), 1)}</td>
       <td class="rank">${cell(displayPPG(stats), 1)}</td>
       <td class="rank">${cell(stats && stats.gp != null ? stats.gp : null)}</td>
       <td class="rank">${cell(stats && stats.cp, 1)}</td>
@@ -1115,17 +1147,15 @@ function renderDraftBoard(){
       <td class="rank">${cell(stats && stats.rec)}</td>
       <td class="rank">${cell(stats && stats.recy)}</td>
       <td class="rank">${cell(stats && stats.rectd)}</td>
-      <td style="font-size:12px; color:var(--chalk-dim); white-space:nowrap;">${formatSize(p)}</td>
     </tr>`;
   }).join("");
 
   const cols = SORTABLE_COLUMNS.filter(c => c.key !== "adds");
   wrap.innerHTML = `<table>
     <thead><tr>
-      <th onclick="setSort('draft','rank')" style="cursor:pointer;">Rank${state.draftSort.key==='rank'?(state.draftSort.dir==='asc'?' ▲':' ▼'):''}</th>
-      <th>Player</th><th>Pos</th><th>Team</th>
+      <th class="rank-cell" onclick="setSort('draft','rank')" style="cursor:pointer;">Rank${state.draftSort.key==='rank'?(state.draftSort.dir==='asc'?' ▲':' ▼'):''}</th>
+      <th class="player-cell player-cell-draft">Player</th><th>Pos</th><th>Team</th>
       ${cols.filter(c=>c.key!=='rank').map(c => sortableTh(c, state.draftSort, 'draft')).join("")}
-      <th>Size</th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
@@ -1220,9 +1250,13 @@ function renderWaiverTable(){
     const weaknessTag = addressesWeakness ? '<span class="rec-tag rec-ADD">Addresses Weakness</span>' : "";
     const cell = (v, decimals) => v != null ? (decimals != null ? v.toFixed(decimals) : v) : "—";
     return `<tr>
-      <td class="player-cell"><span style="white-space:nowrap;">${name}</span> ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${weaknessTag}</td>
+      <td class="player-cell player-cell-waiver">
+        <span class="player-name-line">${name}</span>
+        <div class="player-tags-line">${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${weaknessTag}</div>
+      </td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
+      <td class="rank" style="color:var(--amber); font-weight:600;">${cell(computeValueScore(p), 1)}</td>
       <td class="rank">${cell(displayPPG(stats), 1)}</td>
       <td class="rank">${cell(stats && stats.cp, 1)}</td>
       <td class="rank">${cell(stats && stats.cpoe, 1)}</td>
@@ -1237,16 +1271,14 @@ function renderWaiverTable(){
       <td class="rank">${cell(stats && stats.recy)}</td>
       <td class="rank">${cell(stats && stats.rectd)}</td>
       <td class="rank">${(t?.count || 0).toLocaleString()}</td>
-      <td style="font-size:12px; color:var(--chalk-dim); white-space:nowrap;">${formatSize(p)}</td>
     </tr>`;
   }).join("");
 
   const cols = SORTABLE_COLUMNS.filter(c => c.key !== "rank" && c.key !== "gp");
   wrap.innerHTML = `<table>
     <thead><tr>
-      <th>Player</th><th>Pos</th><th>Team</th>
+      <th class="player-cell player-cell-waiver">Player</th><th>Pos</th><th>Team</th>
       ${cols.map(c => sortableTh(c, state.waiverSort, "waiver")).join("")}
-      <th>Size</th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>
