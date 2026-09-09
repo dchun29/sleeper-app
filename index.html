@@ -298,6 +298,7 @@
           <button class="ghost" onclick="renderLineupOptimizer()">Recalculate</button>
         </div>
         <div id="lineupWrap"><div class="loading">Connect your league to optimize your lineup.</div></div>
+        <div id="teamAnalyzerWrap"></div>
       </div>
       <div class="card">
         <h2>Bench</h2>
@@ -1585,20 +1586,18 @@ function projectedPts(p){
   return {val: base, label: base.toFixed(1), warn, context:""};
 }
 
-function renderLineupOptimizer(){
-  const wrap = document.getElementById("lineupWrap");
-  const benchWrap = document.getElementById("benchWrap");
-  if(!state.myRoster){ wrap.innerHTML = "<div class='empty'>Couldn't find your roster.</div>"; return; }
-  if(Object.keys(state.players).length === 0){ wrap.innerHTML = "<div class='loading'>Loading player data...</div>"; return; }
-
+// Fills starting slots for ANY player pool using the league's actual roster
+// requirements — reused both for "my" lineup and for computing every other
+// team's optimal lineup, so the Team Analyzer compares like-for-like
+// (starters vs. starters), not "my starters" vs. "their whole roster."
+function computeOptimalLineupForPlayers(playerIds){
   const rawSlots = (state.league.roster_positions || []).filter(s => s !== "BN" && s !== "IR" && s !== "TAXI");
-  // process strict single positions first, then flex-type slots (widest eligibility last)
   const strict = rawSlots.filter(s => ["QB","RB","WR","TE","K","DEF"].includes(s));
   const flexy = rawSlots.filter(s => !strict.includes(s))
     .sort((a,b) => (FLEX_ELIGIBLE[a] ? FLEX_ELIGIBLE[a].length : 4) - (FLEX_ELIGIBLE[b] ? FLEX_ELIGIBLE[b].length : 4));
   const orderedSlots = [...strict, ...flexy];
 
-  const pool = (state.myRoster.players || [])
+  const pool = (playerIds || [])
     .map(pid => state.players[pid])
     .filter(Boolean)
     .map(p => ({p, proj: projectedPts(p)}));
@@ -1621,6 +1620,17 @@ function renderLineupOptimizer(){
   });
 
   const totalProj = assignments.reduce((s,a) => s + a.proj.val, 0);
+  const benched = pool.filter(x => !used.has(x.p.player_id));
+  return {assignments, totalProj, benched};
+}
+
+function renderLineupOptimizer(){
+  const wrap = document.getElementById("lineupWrap");
+  const benchWrap = document.getElementById("benchWrap");
+  if(!state.myRoster){ wrap.innerHTML = "<div class='empty'>Couldn't find your roster.</div>"; return; }
+  if(Object.keys(state.players).length === 0){ wrap.innerHTML = "<div class='loading'>Loading player data...</div>"; return; }
+
+  const {assignments, totalProj, benched} = computeOptimalLineupForPlayers(state.myRoster.players || []);
 
   wrap.innerHTML = `
     <div class="stat-box" style="margin-bottom:14px; display:inline-block;">
@@ -1645,7 +1655,7 @@ function renderLineupOptimizer(){
     </table>
   `.replace("SEASON_STATS_YEAR", SEASON_STATS_YEAR);
 
-  const benched = pool.filter(x => !used.has(x.p.player_id));
+  renderTeamAnalyzer();
   benchWrap.innerHTML = benched.length === 0 ? "<div class='empty'>Nothing on your bench yet.</div>" : `
     <table>
       <thead><tr><th>Player</th><th>Pos</th><th>Proj</th></tr></thead>
@@ -1660,7 +1670,64 @@ function renderLineupOptimizer(){
   `;
 }
 
-/* ---------------- ALERTS: ROSTER WATCH (instant, free) ---------------- */
+/* ---------------- TEAM ANALYZER (based on optimal starters, not whole roster) ---------------- */
+// Computes every team's OWN optimal lineup (same algorithm as yours) so the
+// comparison is genuinely apples-to-apples — your starters vs. their
+// starters, not your starters vs. their whole bench-included roster.
+function computeLeagueOptimalLineups(){
+  return (state.rosters || []).map(r => {
+    const {assignments, totalProj} = computeOptimalLineupForPlayers(r.players || []);
+    return {rosterId: r.roster_id, isMe: r.owner_id === state.myUserId, assignments, totalProj};
+  });
+}
+
+function renderTeamAnalyzer(){
+  const wrap = document.getElementById("teamAnalyzerWrap");
+  if(!wrap) return;
+  if(!state.myRoster || Object.keys(state.players).length === 0){ wrap.innerHTML = ""; return; }
+
+  const lineups = computeLeagueOptimalLineups();
+  const mine = lineups.find(l => l.isMe);
+  if(!mine || lineups.length < 2){ wrap.innerHTML = ""; return; }
+
+  const n = lineups.length;
+  const sortedByTotal = [...lineups].sort((a,b) => b.totalProj - a.totalProj);
+  const overallRank = sortedByTotal.findIndex(l => l.isMe) + 1;
+  const topCut = Math.max(1, Math.ceil(n / 3));
+  const grade = overallRank <= topCut ? "A" : overallRank > n - topCut ? "C" : "B";
+  const gradeColor = grade === "A" ? "var(--turf-bright)" : grade === "C" ? "var(--danger)" : "var(--amber)";
+
+  // Per-slot comparison: for each of your starting slots, rank your player's
+  // projection against every other team's player in that same slot position.
+  const slotRows = mine.assignments.map((a, idx) => {
+    const slotProjections = lineups.map(l => (l.assignments[idx] ? l.assignments[idx].proj.val : 0));
+    const sorted = [...slotProjections].sort((x,y) => y - x);
+    const myVal = a.proj.val;
+    const rank = sorted.indexOf(myVal) + 1;
+    const isWeak = rank > n - topCut;
+    const isStrong = rank <= topCut;
+    const name = a.p ? (a.p.full_name || a.p.player_id) : "Empty";
+    return {slot: a.slot, name, val: myVal, rank, isWeak, isStrong};
+  });
+
+  const weakLinks = slotRows.filter(r => r.isWeak);
+  const strengths = slotRows.filter(r => r.isStrong);
+
+  const fmtSlot = r => `<span class="pos-badge" style="background:var(--panel-2); color:${r.isStrong?'var(--turf-bright)':(r.isWeak?'var(--danger)':'var(--chalk-dim)')};">${r.slot}: ${r.name} — ${r.val.toFixed(1)} pts (${r.rank}/${n})</span>`;
+
+  wrap.innerHTML = `
+    <div class="alert-card" style="margin-top:14px;">
+      <div class="ahead">
+        <span class="aname">Team Analyzer — Based on Optimal Starters</span>
+        <span class="rec-tag rec-ADD" style="border-color:${gradeColor}; color:${gradeColor};">Grade: ${grade} (${overallRank}/${n})</span>
+      </div>
+      <div class="atext" style="margin-bottom:6px;">Your optimal starting lineup projects for <b>${mine.totalProj.toFixed(1)} pts</b>, ranking ${overallRank} of ${n} teams by starters alone — bench depth doesn't count here, since it doesn't score.</div>
+      <div class="atext" style="margin-bottom:6px;"><b style="color:var(--turf-bright);">Strong starting slots:</b> ${strengths.map(fmtSlot).join(" ") || "—"}</div>
+      <div class="atext"><b style="color:var(--danger);">Weak starting slots:</b> ${weakLinks.map(fmtSlot).join(" ") || "—"}</div>
+      <div class="hint" style="margin-top:6px;">Ranked against every other team's own optimal lineup, not their full rosters — a fair starters-vs-starters comparison.</div>
+    </div>
+  `;
+}
 let trendingDropIds = new Set();
 
 async function loadTrendingDropForWatch(){
