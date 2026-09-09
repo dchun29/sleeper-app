@@ -903,6 +903,16 @@ function computeMyDraftNeeds(){
     priority[pos] = need[pos] - (earlyRoundPenalty[pos] || 0);
   });
 
+  // Hard stop, not just deprioritized: once your starting QB slot(s) are
+  // actually filled, stop suggesting more QBs entirely. A backup QB in a
+  // single-QB league is low value — this isn't the same soft "wait early"
+  // logic above, it's "you're done here" once the real need is met.
+  // (Superflex/2-QB leagues need starters.QB=2, so this naturally waits
+  // for both slots there instead of just one.)
+  if(drafted.QB >= Math.ceil(starters.QB)){
+    priority.QB = -99;
+  }
+
   // Warnings: meaningfully imbalanced positions (drafted well past target
   // while another starter-required position still sits at zero)
   const warnings = [];
