@@ -261,17 +261,35 @@
     <!-- WAIVERS TAB -->
     <div class="panel" id="panel-waivers">
       <div class="card">
-        <h2>Trending Waiver Adds</h2>
-        <div class="desc">Players being added across all of Sleeper in the last 48 hours, filtered to who's actually available in YOUR league.</div>
+        <h2>Waiver Wire</h2>
+        <div class="desc" id="waiverSummary">Ranks every free agent in your league by how many points they'd actually add to your optimal lineup — not by how many people on Sleeper are adding them.</div>
         <div class="controls-row">
-          <select id="waiverLookback" onchange="loadTrending()">
-            <option value="24">Last 24 hrs</option>
-            <option value="48" selected>Last 48 hrs</option>
-            <option value="168">Last 7 days</option>
+          <select id="waiverSource" onchange="setWaiverSource(this.value)">
+            <option value="upgrades" selected>Lineup upgrades (recommended)</option>
+            <option value="best">Best available</option>
+            <option value="trending">Trending on Sleeper</option>
           </select>
-          <button class="ghost" onclick="loadTrending()">Refresh</button>
+          <select id="waiverPos" onchange="state.waiverFilter.pos=this.value; renderWaiverTable();">
+            <option value="ALL">All positions</option>
+            <option value="QB">QB</option>
+            <option value="RB">RB</option>
+            <option value="WR">WR</option>
+            <option value="TE">TE</option>
+            <option value="FLEX">FLEX (RB/WR/TE)</option>
+          </select>
+          <select id="waiverLookback" onchange="loadTrending()" title="Only affects the Adds column / Trending view">
+            <option value="24">Adds: last 24 hrs</option>
+            <option value="48" selected>Adds: last 48 hrs</option>
+            <option value="168">Adds: last 7 days</option>
+          </select>
+          <button class="ghost" onclick="loadTrending(true)">Refresh roster &amp; injuries</button>
         </div>
         <div id="waiverWrap"><div class="loading">Connect your league to see waiver targets.</div></div>
+      </div>
+      <div class="card">
+        <h2>Roster Audit</h2>
+        <div class="desc">Every player you roster vs. the best free agent at the same position. Flags injured players and underperformers you could replace.</div>
+        <div id="auditWrap"></div>
       </div>
       <div class="card">
         <h2>Your Roster Needs</h2>
@@ -585,6 +603,8 @@ async function loadLiveStats(silent){
     // refresh any currently visible views that use stats
     renderDraftBoard();
     renderLineupOptimizer();
+    const wp = document.getElementById("panel-waivers");
+    if(wp && wp.classList.contains("active")) loadTrending();
   } catch(e){
     if(statusEl) statusEl.textContent = `Couldn't load live stats (${e.message}) — using the built-in snapshot instead. Double-check the URL below.`;
   }
@@ -614,6 +634,7 @@ async function loadPlayers(force){
       p._stats = lookupStats(p);
     });
     annotateLeaguePPG();
+    state.playersLoadedAt = Date.now();
     renderDraftBoard();
   } catch(e){
     wrap.innerHTML = `<div class="err">Couldn't load player data: ${e.message}</div>`;
@@ -1117,6 +1138,7 @@ function statValue(p, key){
   if(key === "ppg") return displayPPG(p._stats);
   if(key === "gp") return p._stats ? p._stats.gp : null;
   if(key === "adds") return p._addCount != null ? p._addCount : null;
+  if(key === "gain") return p._waiverGain != null ? p._waiverGain : null;
   return p._stats ? p._stats[key] : null;
 }
 
@@ -1343,91 +1365,270 @@ function startWaiverAutoRefresh(){
 }
 
 /* ---------------- WAIVERS ---------------- */
-async function loadTrending(){
+// Ranks free agents by LINEUP GAIN: re-run the lineup optimizer with the player
+// added and see how many projected points your best lineup gains. That is the
+// only number that matters for a waiver claim, and it naturally suppresses
+// positions you're already stacked at (e.g. QBs when your QB1 is healthy).
+state.waiverFilter = {source:"upgrades", pos:"ALL"};
+state.waiverSort = {key:"gain", dir:"desc"};
+state.waiverEntries = [];
+state.waiverMeta = {};
+const GAIN_MIN = 0.3;               // below this, an "upgrade" is noise
+const FLEX_POS = ["RB","WR","TE"];
+const OUT_STATUSES = ["Out","IR","PUP","Suspended"];
+
+function setWaiverSource(src){
+  state.waiverFilter.source = src;
+  state.waiverSort = {key: src === "trending" ? "adds" : src === "best" ? "ppg" : "gain", dir:"desc"};
+  renderWaiverTable();
+}
+
+async function refreshRosterState(){
+  const rosters = await safeGet(`${API}/league/${state.leagueId}/rosters`);
+  state.rosters = rosters;
+  state.myRoster = rosters.find(r => r.owner_id === state.userId) || state.myRoster;
+  state.rosteredIds = new Set();
+  rosters.forEach(r => (r.players||[]).forEach(pid => state.rosteredIds.add(pid)));
+}
+
+async function loadTrending(forceFull){
   const wrap = document.getElementById("waiverWrap");
-  wrap.innerHTML = "<div class='loading'>Loading trending adds...</div>";
-  const hours = document.getElementById("waiverLookback").value;
+  if(!state.leagueId){ return; }
+  wrap.innerHTML = "<div class='loading'>Checking your roster, injuries and the wire...</div>";
   try{
-    const trending = await safeGet(`${API}/players/nfl/trending/add?lookback_hours=${hours}&limit=50`);
-    if(Object.keys(state.players).length === 0) await loadPlayers(false);
+    await refreshRosterState();
+    const stale = !state.playersLoadedAt || (Date.now() - state.playersLoadedAt) > 20*60*1000;
+    if(forceFull === true || Object.keys(state.players).length === 0 || stale) await loadPlayers(false);
 
-    const available = trending
-      .filter(t => !state.rosteredIds.has(t.player_id))
-      .map(t => ({...t, player: state.players[t.player_id]}))
-      .filter(t => t.player && t.player.team) // exclude true free agents
-      .slice(0, 25);
+    // Add counts are informational; a failure here must not break the tab.
+    try{
+      const hours = document.getElementById("waiverLookback").value;
+      const trending = await safeGet(`${API}/players/nfl/trending/add?lookback_hours=${hours}&limit=100`);
+      Object.values(state.players).forEach(p => { p._addCount = null; });
+      trending.forEach(t => { const p = state.players[t.player_id]; if(p) p._addCount = t.count; });
+    } catch(e){ /* ignore */ }
 
-    available.forEach(t => { t.player._addCount = t.count; }); // for the Add Volume sort column
-    state.waiverAvailable = available;
-
-    if(available.length === 0){
-      wrap.innerHTML = "<div class='empty'>No trending free agents available in your league right now — check back closer to games.</div>";
-      return;
-    }
+    buildWaiverPool();
     renderWaiverTable();
+    renderRosterAudit();
+    renderNeeds();
   } catch(e){
-    wrap.innerHTML = `<div class="err">Couldn't load trending players: ${e.message}</div>`;
+    wrap.innerHTML = `<div class="err">Couldn't load the waiver wire: ${e.message}</div>`;
   }
+}
+
+function playerNameOf(p){
+  return p ? (p.full_name || `${p.first_name||""} ${p.last_name||""}`.trim()) : "";
+}
+
+function hasOpenRosterSpot(){
+  const r = state.myRoster; if(!r) return false;
+  const slots = (state.league.roster_positions || []).filter(s => s !== "IR" && s !== "TAXI").length;
+  const occupied = (r.players||[]).length - (r.reserve||[]).length - (r.taxi||[]).length;
+  return occupied < slots;
+}
+
+// Lowest-value player you could cut after adding `candId`: never a starter in
+// the new lineup, never someone on IR, and long-term injured stars are the
+// last resort (you may want to stash them).
+function suggestDrop(benched, candId){
+  const reserve = new Set((state.myRoster && state.myRoster.reserve) || []);
+  const pool = benched.filter(x => x.p.player_id !== candId && !reserve.has(x.p.player_id));
+  if(pool.length === 0) return null;
+  const keep = x => {
+    const ppg = displayPPG(x.p._stats) || 0;
+    const outStar = OUT_STATUSES.includes(x.p.injury_status) && ppg >= 10;
+    return ppg + (outStar ? 100 : 0);
+  };
+  return pool.sort((a,b) => keep(a) - keep(b))[0].p;
+}
+
+function buildWaiverPool(){
+  const myIds = (state.myRoster && state.myRoster.players) || [];
+  const base = computeOptimalLineupForPlayers(myIds);
+  const baseStarters = new Set(base.assignments.filter(a => a.p).map(a => a.p.player_id));
+  const slotsByPlayer = {};
+  base.assignments.forEach(a => { if(a.p) slotsByPlayer[a.p.player_id] = a; });
+
+  const qbSlots = (state.league.roster_positions || []).filter(x => x === "QB" || x === "SUPER_FLEX").length || 1;
+  const healthyQBs = myIds.map(id => state.players[id]).filter(p => p && p.position === "QB" && projectedPts(p).val > 0).length;
+  const qbNeeded = healthyQBs < qbSlots;
+  const openSpot = hasOpenRosterSpot();
+
+  const entries = [];
+  Object.values(state.players).forEach(p => {
+    p._waiverGain = null;
+    if(!p.team || state.rosteredIds.has(p.player_id)) return;
+    if(!["QB","RB","WR","TE"].includes(p.position)) return;
+    const ppg = displayPPG(p._stats);
+    if(ppg == null) return;
+    const withP = computeOptimalLineupForPlayers([...myIds, p.player_id]);
+    const gain = withP.totalProj - base.totalProj;
+    const newStarters = new Set(withP.assignments.filter(a => a.p).map(a => a.p.player_id));
+    // Who gets pushed out of the lineup by this add?
+    let displaced = null;
+    if(newStarters.has(p.player_id)){
+      const out = [...baseStarters].filter(id => !newStarters.has(id));
+      if(out.length) displaced = slotsByPlayer[out[0]];
+    }
+    const drop = openSpot ? null : suggestDrop(withP.benched, p.player_id);
+    p._waiverGain = gain;
+    entries.push({player:p, gain, displaced, drop, count: p._addCount || 0, gp: p._stats ? p._stats.gp : null});
+  });
+
+  state.waiverEntries = entries;
+  state.waiverMeta = {baseTotal: base.totalProj, qbNeeded, openSpot, qbSlots};
+}
+
+function waiverEntriesForView(){
+  const {source, pos} = state.waiverFilter;
+  const meta = state.waiverMeta || {};
+  let list = (state.waiverEntries || []).slice();
+
+  if(pos === "FLEX") list = list.filter(e => FLEX_POS.includes(e.player.position));
+  else if(pos !== "ALL") list = list.filter(e => e.player.position === pos);
+
+  if(source === "upgrades"){
+    list = list.filter(e => e.gain >= GAIN_MIN && (e.gp == null || e.gp >= 2));
+  } else if(source === "trending"){
+    list = list.filter(e => e.count > 0);
+  }
+  // Without an explicit position filter, QBs only show up if they'd start for you.
+  if(pos === "ALL" && !meta.qbNeeded){
+    list = list.filter(e => e.player.position !== "QB" || e.gain >= GAIN_MIN);
+  }
+  return list;
 }
 
 function renderWaiverTable(){
   const wrap = document.getElementById("waiverWrap");
-  const available = state.waiverAvailable || [];
-  if(available.length === 0) return;
+  const sum = document.getElementById("waiverSummary");
+  if(!state.waiverEntries || state.waiverEntries.length === 0){
+    if(Object.keys(state.players).length) wrap.innerHTML = "<div class='empty'>No free agents with stats found yet. Hit Refresh, or wait for the live stats feed to load.</div>";
+    return;
+  }
+  const meta = state.waiverMeta || {};
+  const view = waiverEntriesForView();
+  const bestGain = Math.max(0, ...(state.waiverEntries.map(e => e.gain)));
+  if(sum){
+    sum.innerHTML = `Your optimal lineup projects <b>${meta.baseTotal.toFixed(1)}</b> pts/week (season-average pace). The single best add right now is worth <b>${bestGain >= GAIN_MIN ? "+"+bestGain.toFixed(1) : "≈0"}</b>. ${meta.openSpot ? "You have an open roster spot — no drop needed." : "Roster is full, so each add shows who to cut."}`;
+  }
 
   const need = rosterPositionCounts();
   const filled = myPositionFilled();
-  const weakKeys = myWeakCategoryKeys(false);
+  const byKey = new Map(view.map(e => [e.player, e]));
+  const sorted = sortPlayersByColumn(view.map(e => e.player), state.waiverSort.key, state.waiverSort.dir);
 
-  const sorted = sortPlayersByColumn(available.map(t => t.player), state.waiverSort.key, state.waiverSort.dir);
+  if(sorted.length === 0){
+    const msg = state.waiverFilter.source === "upgrades"
+      ? `No free agent at this position would improve your lineup by ${GAIN_MIN}+ pts. That's real information: this spot isn't your problem. Try "Best available" to see who's out there, or another position.`
+      : "Nothing matches this filter.";
+    wrap.innerHTML = `<div class='empty'>${msg}</div>`;
+    return;
+  }
 
-  const rows = sorted.map(p => {
-    const t = available.find(x => x.player === p);
-    const name = p.full_name || `${p.first_name||""} ${p.last_name||""}`.trim();
-    const isNeed = need[p.position] && filled[p.position] < need[p.position];
+  const cell = (v, d) => v != null ? (d != null ? v.toFixed(d) : v) : "—";
+  const rows = sorted.slice(0, 40).map(p => {
+    const e = byKey.get(p);
+    const name = playerNameOf(p);
     const inj = p.injury_status && INJURY_LABEL[p.injury_status];
     const stats = p._stats;
-    const extraTag = buildContextTag(stats);
-    const addressesWeakness = stats && weakKeys.some(k =>
-      STAT_CATEGORIES.find(c => c.key === k)?.posGroup.includes(p.position) && (stats[k] || 0) > 0
-    );
-    const weaknessTag = addressesWeakness ? '<span class="rec-tag rec-ADD">Addresses Weakness</span>' : "";
-    const cell = (v, decimals) => v != null ? (decimals != null ? v.toFixed(decimals) : v) : "—";
+    const isNeed = need[p.position] && filled[p.position] < need[p.position];
+    const small = e.gp != null && e.gp < 3 ? '<span class="need-tag" style="border-color:var(--amber); color:var(--amber);">small sample</span>' : "";
+    let why = "";
+    if(e.gain >= GAIN_MIN && e.displaced){
+      const dn = playerNameOf(e.displaced.p);
+      const dInj = e.displaced.proj.warn ? ` (${e.displaced.proj.warn})` : ` (${e.displaced.proj.label})`;
+      why = `<div class="hint">Starts over ${dn}${dInj} at ${e.displaced.slot}</div>`;
+    } else if(e.gain >= GAIN_MIN){
+      why = `<div class="hint">Fills an empty starting slot</div>`;
+    }
+    const dropTxt = e.gain < GAIN_MIN ? "—" : e.drop ? `${playerNameOf(e.drop)} <span class="hint">(${cell(displayPPG(e.drop._stats),1)})</span>` : "open spot";
     return `<tr>
       <td class="player-cell player-cell-waiver">
         <span class="player-name-line">${name}</span>
-        <div class="player-tags-line">${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${extraTag} ${weaknessTag}</div>
+        <div class="player-tags-line">${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""} ${isNeed ? '<span class="need-tag">Fills Need</span>' : ""} ${small}</div>
+        ${why}
       </td>
       <td><span class="pos-badge pos-${p.position}">${p.position}</span></td>
       <td>${p.team || "FA"}</td>
-      <td class="rank">${formatValueScore(p)}</td>
+      <td class="rank" style="font-weight:700; color:${e.gain >= GAIN_MIN ? "var(--turf-bright)" : "inherit"};">${e.gain >= GAIN_MIN ? "+" + e.gain.toFixed(1) : "0"}</td>
+      <td>${dropTxt}</td>
       <td class="rank">${cell(displayPPG(stats), 1)}</td>
-      <td class="rank">${cell(stats && stats.cp, 1)}</td>
-      <td class="rank">${cell(stats && stats.cpoe, 1)}</td>
+      <td class="rank">${cell(stats && stats.gp)}</td>
+      <td class="rank">${cell(stats && stats.tgtshare, 1)}</td>
+      <td class="rank">${cell(stats && stats.ry)}</td>
+      <td class="rank">${cell(stats && stats.recy)}</td>
+      <td class="rank">${cell(stats && (stats.rtd != null || stats.rectd != null ? (stats.rtd||0) + (stats.rectd||0) : null))}</td>
       <td class="rank">${cell(stats && stats.py)}</td>
       <td class="rank">${cell(stats && stats.ptd)}</td>
-      <td class="rank">${cell(stats && stats.int)}</td>
-      <td class="rank">${cell(stats && stats.ry)}</td>
-      <td class="rank">${cell(stats && stats.rtd)}</td>
-      <td class="rank">${cell(stats && stats.tgt)}</td>
-      <td class="rank">${cell(stats && stats.tgtshare, 1)}</td>
-      <td class="rank">${cell(stats && stats.rec)}</td>
-      <td class="rank">${cell(stats && stats.recy)}</td>
-      <td class="rank">${cell(stats && stats.rectd)}</td>
       <td class="rank">${cell(stats && stats.sos, 0)}</td>
-      <td class="rank">${(t?.count || 0).toLocaleString()}</td>
+      <td class="rank">${e.count ? e.count.toLocaleString() : "—"}</td>
     </tr>`;
   }).join("");
 
-  const cols = SORTABLE_COLUMNS.filter(c => c.key !== "rank" && c.key !== "gp");
-  wrap.innerHTML = `<table>
+  const th = (key, label) => sortableTh({key, label}, state.waiverSort, "waiver");
+  wrap.innerHTML = `<div style="overflow-x:auto;"><table>
     <thead><tr>
       <th class="player-cell player-cell-waiver">Player</th><th>Pos</th><th>Team</th>
-      ${cols.map(c => sortableTh(c, state.waiverSort, "waiver")).join("")}
+      ${th("gain","Lineup Gain")}<th>Drop</th>${th("ppg","PPG")}${th("gp","GP")}${th("tgtshare","Tgt %")}${th("ry","Rush Yds")}${th("recy","Rec Yds")}<th>TDs</th>${th("py","Pass Yds")}${th("ptd","Pass TD")}${th("sos","SOS")}${th("adds","Adds")}
     </tr></thead>
     <tbody>${rows}</tbody>
-  </table>
-  <div class="hint" style="margin-top:10px;">Stats reflect the current season once it starts — right now that's still last season's numbers. Auto-refreshes every 90 seconds while you're on this tab.</div>`;
+  </table></div>
+  <div class="hint" style="margin-top:10px;">Lineup Gain = projected points your best lineup adds with this player on it. Projections are season-average PPG (league scoring) with injury discounts — they ignore bye weeks and matchups, and players with fewer than 3 games are noisy. Showing top ${Math.min(40, sorted.length)} of ${sorted.length}. K/DEF aren't ranked (the stats feed doesn't cover them).</div>`;
+}
+
+function renderRosterAudit(){
+  const wrap = document.getElementById("auditWrap");
+  if(!wrap) return;
+  if(!state.myRoster || !state.waiverEntries || !state.waiverEntries.length){ wrap.innerHTML = ""; return; }
+  const myIds = state.myRoster.players || [];
+  const {assignments} = computeOptimalLineupForPlayers(myIds);
+  const slotOf = {};
+  assignments.forEach(a => { if(a.p) slotOf[a.p.player_id] = a.slot; });
+
+  // Best credible free agent per position (needs 2+ games so one fluke week doesn't set the bar).
+  const bestFA = {};
+  state.waiverEntries.forEach(e => {
+    if(e.gp != null && e.gp < 2) return;
+    const ppg = displayPPG(e.player._stats) || 0;
+    const cur = bestFA[e.player.position];
+    if(!cur || ppg > cur.ppg) bestFA[e.player.position] = {p: e.player, ppg};
+  });
+
+  const rows = myIds.map(id => state.players[id]).filter(p => p && ["QB","RB","WR","TE"].includes(p.position)).map(p => {
+    const ppg = displayPPG(p._stats);
+    const fa = bestFA[p.position];
+    const delta = fa && ppg != null ? fa.ppg - ppg : (fa ? fa.ppg : 0);
+    const out = OUT_STATUSES.includes(p.injury_status);
+    const hurt = out || p.injury_status === "Doubtful";
+    const starter = slotOf[p.player_id];
+    let verdict, color;
+    if(hurt && ppg != null && ppg >= 10){ verdict = "Injured star — stash or replace for now"; color = "var(--amber)"; }
+    else if(hurt){ verdict = "Injured — cut candidate"; color = "var(--danger)"; }
+    else if(ppg == null){ verdict = "No stats yet"; color = "inherit"; }
+    else if(delta >= 1.5){ verdict = starter ? "Starting but replaceable" : "Cut candidate"; color = "var(--danger)"; }
+    else if(starter){ verdict = "Keep"; color = "var(--turf-bright)"; }
+    else { verdict = "Bench depth"; color = "inherit"; }
+    return {p, ppg, fa, delta, starter, verdict, color, hurt};
+  }).sort((a,b) => (b.delta * (b.starter ? 1.5 : 1)) - (a.delta * (a.starter ? 1.5 : 1)));
+
+  wrap.innerHTML = `<div style="overflow-x:auto;"><table>
+    <thead><tr><th class="player-cell">Player</th><th>Pos</th><th>Role</th><th>PPG</th><th>Best FA (same pos)</th><th>FA edge</th><th>Verdict</th></tr></thead>
+    <tbody>${rows.map(r => {
+      const inj = r.p.injury_status && INJURY_LABEL[r.p.injury_status];
+      return `<tr>
+        <td class="player-cell">${playerNameOf(r.p)} ${inj ? `<span class="need-tag" style="border-color:var(--danger); color:var(--danger);">${inj}</span>` : ""}</td>
+        <td><span class="pos-badge pos-${r.p.position}">${r.p.position}</span></td>
+        <td>${r.starter || "Bench"}</td>
+        <td class="rank">${r.ppg != null ? r.ppg.toFixed(1) : "—"}</td>
+        <td>${r.fa ? `${playerNameOf(r.fa.p)} <span class="hint">(${r.fa.ppg.toFixed(1)})</span>` : "—"}</td>
+        <td class="rank">${r.fa ? (r.delta > 0 ? "+" : "") + r.delta.toFixed(1) : "—"}</td>
+        <td style="color:${r.color}; font-weight:600;">${r.verdict}</td>
+      </tr>`;
+    }).join("")}</tbody>
+  </table></div>
+  <div class="hint" style="margin-top:10px;">"FA edge" = best available free agent's PPG minus yours. A big positive on a player you can actually drop is your waiver claim. Sorted most replaceable first.</div>`;
 }
 
 function renderNeeds(){
